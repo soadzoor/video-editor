@@ -1,0 +1,1420 @@
+import {
+  ChangeEvent,
+  DragEvent as ReactDragEvent,
+  MouseEvent as ReactMouseEvent,
+  PointerEvent as ReactPointerEvent,
+  useEffect,
+  useMemo,
+  useRef,
+  useState
+} from "react";
+import { exportEditedTimeline, type ExportStage } from "./ffmpeg/export";
+
+interface SourceClip {
+  id: string;
+  file: File;
+  url: string;
+  duration: number;
+  width: number;
+  height: number;
+}
+
+interface TimelineItem {
+  id: string;
+  sourceClipId: string;
+  sourceStart: number;
+  sourceEnd: number;
+}
+
+interface TimelineDisplayItem extends TimelineItem {
+  index: number;
+  duration: number;
+  timelineStart: number;
+  timelineEnd: number;
+}
+
+interface EditedSegment {
+  id: string;
+  timelineItemId: string;
+  clipId: string;
+  sourceStart: number;
+  sourceEnd: number;
+  timelineStart: number;
+  timelineEnd: number;
+  editedStart: number;
+  editedEnd: number;
+}
+
+interface PendingSeek {
+  sourceTime: number;
+  autoPlay: boolean;
+}
+
+interface TrimWindowDragState {
+  pointerId: number;
+  startClientX: number;
+  railWidthPx: number;
+  initialStartSec: number;
+  initialEndSec: number;
+}
+
+interface PlayheadDragState {
+  pointerId: number;
+  railLeftPx: number;
+  railWidthPx: number;
+}
+
+type TimelineTool = "select" | "razor";
+
+const MIN_EDIT_GAP_SEC = 0.1;
+const SEGMENT_END_EPSILON = 0.03;
+
+function makeId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `id-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) {
+    return min;
+  }
+  return Math.min(max, Math.max(min, value));
+}
+
+function nearlyEqual(a: number, b: number): boolean {
+  return Math.abs(a - b) <= 0.000001;
+}
+
+function formatDuration(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return "00:00";
+  }
+
+  const rounded = Math.round(seconds);
+  const mins = Math.floor(rounded / 60);
+  const secs = rounded % 60;
+  return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+}
+
+function formatSecondsLabel(seconds: number): string {
+  return `${Math.max(0, seconds).toFixed(2)}s`;
+}
+
+function formatFileSize(bytes: number): string {
+  const sizeMb = bytes / (1024 * 1024);
+  return `${sizeMb.toFixed(2)} MB`;
+}
+
+function exportStageLabel(stage: ExportStage): string {
+  switch (stage) {
+    case "loading-core":
+      return "Loading FFmpeg core...";
+    case "preparing-inputs":
+      return "Preparing source files...";
+    case "processing-fast":
+      return "Building edited timeline...";
+    case "processing-reencode":
+      return "Retrying with re-encode...";
+    case "finalizing":
+      return "Finalizing export...";
+  }
+}
+
+async function loadVideoMetadata(
+  url: string
+): Promise<{ duration: number; width: number; height: number }> {
+  const video = document.createElement("video");
+  video.preload = "metadata";
+
+  return new Promise((resolve, reject) => {
+    const handleLoaded = () => {
+      const metadata = {
+        duration: Number.isFinite(video.duration) ? video.duration : 0,
+        width: video.videoWidth || 0,
+        height: video.videoHeight || 0
+      };
+      cleanup();
+      resolve(metadata);
+    };
+
+    const handleError = () => {
+      cleanup();
+      reject(new Error("Unable to read video metadata."));
+    };
+
+    const cleanup = () => {
+      video.removeEventListener("loadedmetadata", handleLoaded);
+      video.removeEventListener("error", handleError);
+      video.src = "";
+    };
+
+    video.addEventListener("loadedmetadata", handleLoaded);
+    video.addEventListener("error", handleError);
+    video.src = url;
+  });
+}
+
+function timelineDurationFromItems(items: TimelineItem[]): number {
+  return items.reduce((sum, item) => sum + Math.max(0, item.sourceEnd - item.sourceStart), 0);
+}
+
+function buildTimelineDisplayItems(items: TimelineItem[]): TimelineDisplayItem[] {
+  const displayItems: TimelineDisplayItem[] = [];
+  let offset = 0;
+
+  for (const [index, item] of items.entries()) {
+    const duration = Math.max(0, item.sourceEnd - item.sourceStart);
+    if (duration <= 0.001) {
+      continue;
+    }
+
+    displayItems.push({
+      ...item,
+      index,
+      duration,
+      timelineStart: offset,
+      timelineEnd: offset + duration
+    });
+    offset += duration;
+  }
+
+  return displayItems;
+}
+
+function buildEditedSegments(
+  timelineItems: TimelineDisplayItem[],
+  trimStartSec: number,
+  trimEndSec: number
+): EditedSegment[] {
+  const totalDuration =
+    timelineItems.length > 0 ? timelineItems[timelineItems.length - 1].timelineEnd : 0;
+  if (totalDuration <= 0) {
+    return [];
+  }
+
+  const keepStart = clamp(trimStartSec, 0, totalDuration);
+  const keepEnd = clamp(trimEndSec, keepStart, totalDuration);
+  if (keepEnd - keepStart <= 0.001) {
+    return [];
+  }
+
+  let editedOffset = 0;
+  const editedSegments: EditedSegment[] = [];
+
+  for (const item of timelineItems) {
+    const overlapStart = Math.max(item.timelineStart, keepStart);
+    const overlapEnd = Math.min(item.timelineEnd, keepEnd);
+    if (overlapEnd - overlapStart <= 0.001) {
+      continue;
+    }
+
+    const sourceStart = item.sourceStart + (overlapStart - item.timelineStart);
+    const sourceEnd = item.sourceStart + (overlapEnd - item.timelineStart);
+    const duration = overlapEnd - overlapStart;
+
+    editedSegments.push({
+      id: `${item.id}:${sourceStart.toFixed(5)}:${sourceEnd.toFixed(5)}`,
+      timelineItemId: item.id,
+      clipId: item.sourceClipId,
+      sourceStart,
+      sourceEnd,
+      timelineStart: overlapStart,
+      timelineEnd: overlapEnd,
+      editedStart: editedOffset,
+      editedEnd: editedOffset + duration
+    });
+
+    editedOffset += duration;
+  }
+
+  return editedSegments;
+}
+
+function findSegmentIndex(segments: EditedSegment[], timeSec: number): number {
+  if (segments.length === 0) {
+    return -1;
+  }
+
+  for (const [index, segment] of segments.entries()) {
+    if (timeSec >= segment.editedStart && timeSec < segment.editedEnd) {
+      return index;
+    }
+  }
+
+  return segments.length - 1;
+}
+
+function moveTimelineItem(
+  items: TimelineItem[],
+  draggedId: string,
+  targetId: string,
+  placeAfter: boolean
+): TimelineItem[] {
+  if (draggedId === targetId) {
+    return items;
+  }
+
+  const draggedIndex = items.findIndex((item) => item.id === draggedId);
+  const targetIndex = items.findIndex((item) => item.id === targetId);
+  if (draggedIndex < 0 || targetIndex < 0) {
+    return items;
+  }
+
+  const next = [...items];
+  const [dragged] = next.splice(draggedIndex, 1);
+  let insertIndex = next.findIndex((item) => item.id === targetId);
+  if (insertIndex < 0) {
+    return items;
+  }
+
+  if (placeAfter) {
+    insertIndex += 1;
+  }
+
+  next.splice(insertIndex, 0, dragged);
+  return next;
+}
+
+function App() {
+  const [clips, setClips] = useState<SourceClip[]>([]);
+  const [timelineItems, setTimelineItems] = useState<TimelineItem[]>([]);
+
+  const [isDragging, setIsDragging] = useState(false);
+  const [isIngesting, setIsIngesting] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const [trimStartSec, setTrimStartSec] = useState(0);
+  const [trimEndSec, setTrimEndSec] = useState(0);
+  const [editedPositionSec, setEditedPositionSec] = useState(0);
+  const [currentSegmentIndex, setCurrentSegmentIndex] = useState(0);
+
+  const [timelineTool, setTimelineTool] = useState<TimelineTool>("select");
+  const [selectedTimelineItemId, setSelectedTimelineItemId] = useState<string | null>(null);
+  const [draggingTimelineItemId, setDraggingTimelineItemId] = useState<string | null>(null);
+
+  const [isExporting, setIsExporting] = useState(false);
+  const [exportStage, setExportStage] = useState<ExportStage | null>(null);
+  const [exportProgress, setExportProgress] = useState(0);
+
+  const [isDraggingTrimWindow, setIsDraggingTrimWindow] = useState(false);
+  const [isDraggingPlayhead, setIsDraggingPlayhead] = useState(false);
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const pendingSeekRef = useRef<PendingSeek | null>(null);
+  const clipsRef = useRef<SourceClip[]>([]);
+
+  const trimRangeShellRef = useRef<HTMLDivElement>(null);
+  const trimWindowDragRef = useRef<TrimWindowDragState | null>(null);
+  const playheadDragRef = useRef<PlayheadDragState | null>(null);
+
+  const clipById = useMemo(() => {
+    return new Map(clips.map((clip) => [clip.id, clip]));
+  }, [clips]);
+
+  const timelineDisplayItems = useMemo(() => {
+    return buildTimelineDisplayItems(timelineItems);
+  }, [timelineItems]);
+
+  const timelineDurationSec =
+    timelineDisplayItems.length > 0
+      ? timelineDisplayItems[timelineDisplayItems.length - 1].timelineEnd
+      : 0;
+
+  const editedSegments = useMemo(
+    () => buildEditedSegments(timelineDisplayItems, trimStartSec, trimEndSec),
+    [timelineDisplayItems, trimStartSec, trimEndSec]
+  );
+
+  const editedDurationSec =
+    editedSegments.length > 0 ? editedSegments[editedSegments.length - 1].editedEnd : 0;
+
+  const activeSegment = editedSegments[currentSegmentIndex] ?? null;
+  const activeClip = activeSegment ? clipById.get(activeSegment.clipId) ?? null : null;
+
+  const minTrimGapSec = Math.min(MIN_EDIT_GAP_SEC, timelineDurationSec);
+
+  const trimStartPercent =
+    timelineDurationSec > 0
+      ? (clamp(trimStartSec, 0, timelineDurationSec) / timelineDurationSec) * 100
+      : 0;
+  const trimEndPercent =
+    timelineDurationSec > 0
+      ? (clamp(trimEndSec, 0, timelineDurationSec) / timelineDurationSec) * 100
+      : 0;
+  const trimRightPercent = Math.max(0, 100 - trimEndPercent);
+
+  const playheadRawSec = useMemo(() => {
+    if (timelineDurationSec <= 0) {
+      return 0;
+    }
+
+    if (editedSegments.length === 0) {
+      return clamp(trimStartSec, 0, timelineDurationSec);
+    }
+
+    if (editedPositionSec <= 0) {
+      return clamp(trimStartSec, 0, timelineDurationSec);
+    }
+
+    if (editedPositionSec >= editedDurationSec) {
+      return clamp(trimEndSec, 0, timelineDurationSec);
+    }
+
+    const segmentIndex = findSegmentIndex(editedSegments, editedPositionSec);
+    if (segmentIndex < 0) {
+      return clamp(trimStartSec, 0, timelineDurationSec);
+    }
+
+    const segment = editedSegments[segmentIndex];
+    return clamp(
+      segment.timelineStart + (editedPositionSec - segment.editedStart),
+      0,
+      timelineDurationSec
+    );
+  }, [
+    editedDurationSec,
+    editedPositionSec,
+    editedSegments,
+    timelineDurationSec,
+    trimEndSec,
+    trimStartSec
+  ]);
+
+  const playheadPercent =
+    timelineDurationSec > 0 ? (clamp(playheadRawSec, 0, timelineDurationSec) / timelineDurationSec) * 100 : 0;
+
+  const selectedTimelineItem = selectedTimelineItemId
+    ? timelineDisplayItems.find((item) => item.id === selectedTimelineItemId) ?? null
+    : null;
+
+  const isBusy = isIngesting || isExporting;
+
+  useEffect(() => {
+    clipsRef.current = clips;
+  }, [clips]);
+
+  useEffect(() => {
+    return () => {
+      for (const clip of clipsRef.current) {
+        URL.revokeObjectURL(clip.url);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (selectedTimelineItemId && !timelineItems.some((item) => item.id === selectedTimelineItemId)) {
+      setSelectedTimelineItemId(null);
+    }
+  }, [selectedTimelineItemId, timelineItems]);
+
+  useEffect(() => {
+    if (draggingTimelineItemId && !timelineItems.some((item) => item.id === draggingTimelineItemId)) {
+      setDraggingTimelineItemId(null);
+    }
+  }, [draggingTimelineItemId, timelineItems]);
+
+  // Reposition playback when timeline structure changes.
+  useEffect(() => {
+    if (editedSegments.length === 0) {
+      videoRef.current?.pause();
+      setCurrentSegmentIndex(0);
+      setEditedPositionSec(0);
+      setIsPlaying(false);
+      pendingSeekRef.current = null;
+      return;
+    }
+
+    const upperBound = Math.max(0, editedDurationSec - 0.0001);
+    const clampedPosition = clamp(editedPositionSec, 0, upperBound);
+    const nextSegmentIndex = Math.max(0, findSegmentIndex(editedSegments, clampedPosition));
+    const nextSegment = editedSegments[nextSegmentIndex];
+    const sourceTime = nextSegment.sourceStart + (clampedPosition - nextSegment.editedStart);
+
+    if (isPlaying) {
+      videoRef.current?.pause();
+      setIsPlaying(false);
+    }
+    if (!nearlyEqual(editedPositionSec, clampedPosition)) {
+      setEditedPositionSec(clampedPosition);
+    }
+    if (currentSegmentIndex !== nextSegmentIndex) {
+      setCurrentSegmentIndex(nextSegmentIndex);
+    }
+
+    pendingSeekRef.current = { sourceTime, autoPlay: false };
+  }, [editedDurationSec, editedSegments]);
+
+  useEffect(() => {
+    if (timelineDurationSec <= 0) {
+      if (!nearlyEqual(trimStartSec, 0)) {
+        setTrimStartSec(0);
+      }
+      if (!nearlyEqual(trimEndSec, 0)) {
+        setTrimEndSec(0);
+      }
+      return;
+    }
+
+    const gap = Math.min(MIN_EDIT_GAP_SEC, timelineDurationSec);
+    const maxStart = Math.max(0, timelineDurationSec - gap);
+    const boundedStart = clamp(trimStartSec, 0, maxStart);
+
+    if (!nearlyEqual(boundedStart, trimStartSec)) {
+      setTrimStartSec(boundedStart);
+      return;
+    }
+
+    const minEnd = Math.min(timelineDurationSec, boundedStart + gap);
+    const boundedEnd = clamp(trimEndSec, minEnd, timelineDurationSec);
+    if (!nearlyEqual(boundedEnd, trimEndSec)) {
+      setTrimEndSec(boundedEnd);
+    }
+  }, [timelineDurationSec, trimEndSec, trimStartSec]);
+
+  useEffect(() => {
+    if (!isDraggingTrimWindow) {
+      return;
+    }
+
+    const handlePointerMove = (event: PointerEvent): void => {
+      const drag = trimWindowDragRef.current;
+      if (!drag || event.pointerId !== drag.pointerId) {
+        return;
+      }
+
+      if (drag.railWidthPx <= 0 || timelineDurationSec <= 0) {
+        return;
+      }
+
+      event.preventDefault();
+
+      const deltaSec =
+        ((event.clientX - drag.startClientX) / drag.railWidthPx) * timelineDurationSec;
+      const windowDuration = Math.max(
+        Math.min(MIN_EDIT_GAP_SEC, timelineDurationSec),
+        drag.initialEndSec - drag.initialStartSec
+      );
+      const maxStart = Math.max(0, timelineDurationSec - windowDuration);
+      const nextStart = clamp(drag.initialStartSec + deltaSec, 0, maxStart);
+      const nextEnd = nextStart + windowDuration;
+
+      setTrimStartSec(nextStart);
+      setTrimEndSec(nextEnd);
+    };
+
+    const stopDragging = (event?: PointerEvent): void => {
+      const drag = trimWindowDragRef.current;
+      if (!drag) {
+        return;
+      }
+      if (event && event.pointerId !== drag.pointerId) {
+        return;
+      }
+      trimWindowDragRef.current = null;
+      setIsDraggingTrimWindow(false);
+    };
+
+    window.addEventListener("pointermove", handlePointerMove, { passive: false });
+    window.addEventListener("pointerup", stopDragging);
+    window.addEventListener("pointercancel", stopDragging);
+
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", stopDragging);
+      window.removeEventListener("pointercancel", stopDragging);
+    };
+  }, [isDraggingTrimWindow, timelineDurationSec]);
+
+  useEffect(() => {
+    if (!isDraggingTrimWindow) {
+      return;
+    }
+
+    if (isBusy || timelineDurationSec <= 0) {
+      trimWindowDragRef.current = null;
+      setIsDraggingTrimWindow(false);
+    }
+  }, [isBusy, isDraggingTrimWindow, timelineDurationSec]);
+
+  useEffect(() => {
+    if (!isDraggingPlayhead) {
+      return;
+    }
+
+    const handlePointerMove = (event: PointerEvent): void => {
+      const drag = playheadDragRef.current;
+      if (!drag || event.pointerId !== drag.pointerId) {
+        return;
+      }
+
+      if (drag.railWidthPx <= 0 || timelineDurationSec <= 0) {
+        return;
+      }
+
+      event.preventDefault();
+      const ratio = clamp((event.clientX - drag.railLeftPx) / drag.railWidthPx, 0, 1);
+      const rawPosition = ratio * timelineDurationSec;
+      seekToTimelinePosition(rawPosition, false);
+    };
+
+    const stopDragging = (event?: PointerEvent): void => {
+      const drag = playheadDragRef.current;
+      if (!drag) {
+        return;
+      }
+      if (event && event.pointerId !== drag.pointerId) {
+        return;
+      }
+      playheadDragRef.current = null;
+      setIsDraggingPlayhead(false);
+    };
+
+    window.addEventListener("pointermove", handlePointerMove, { passive: false });
+    window.addEventListener("pointerup", stopDragging);
+    window.addEventListener("pointercancel", stopDragging);
+
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", stopDragging);
+      window.removeEventListener("pointercancel", stopDragging);
+    };
+  }, [isDraggingPlayhead, timelineDurationSec, trimEndSec, trimStartSec]);
+
+  useEffect(() => {
+    if (!isDraggingPlayhead) {
+      return;
+    }
+
+    if (isBusy || timelineDurationSec <= 0) {
+      playheadDragRef.current = null;
+      setIsDraggingPlayhead(false);
+    }
+  }, [isBusy, isDraggingPlayhead, timelineDurationSec]);
+
+  function resetTimelineWindow(durationSec: number): void {
+    videoRef.current?.pause();
+    setTrimStartSec(0);
+    setTrimEndSec(durationSec);
+    setEditedPositionSec(0);
+    setCurrentSegmentIndex(0);
+    setIsPlaying(false);
+    setSelectedTimelineItemId(null);
+    pendingSeekRef.current = null;
+  }
+
+  async function addVideos(fileList: FileList | null): Promise<void> {
+    if (!fileList || fileList.length === 0) {
+      return;
+    }
+
+    const files = Array.from(fileList).filter((file) => file.type.startsWith("video/"));
+    if (files.length === 0) {
+      setError("No valid video files were provided.");
+      return;
+    }
+
+    setIsIngesting(true);
+    setError(null);
+
+    const nextClips: SourceClip[] = [];
+    try {
+      for (const file of files) {
+        const url = URL.createObjectURL(file);
+        try {
+          const metadata = await loadVideoMetadata(url);
+          if (metadata.duration <= 0) {
+            throw new Error(`Could not read duration for \"${file.name}\".`);
+          }
+
+          nextClips.push({
+            id: makeId(),
+            file,
+            url,
+            duration: metadata.duration,
+            width: metadata.width,
+            height: metadata.height
+          });
+        } catch (metadataError) {
+          URL.revokeObjectURL(url);
+          throw metadataError;
+        }
+      }
+
+      const appendedTimelineItems: TimelineItem[] = nextClips.map((clip) => ({
+        id: makeId(),
+        sourceClipId: clip.id,
+        sourceStart: 0,
+        sourceEnd: clip.duration
+      }));
+
+      const combinedClips = [...clips, ...nextClips];
+      const combinedTimeline = [...timelineItems, ...appendedTimelineItems];
+
+      setClips(combinedClips);
+      setTimelineItems(combinedTimeline);
+      resetTimelineWindow(timelineDurationFromItems(combinedTimeline));
+    } catch (caughtError) {
+      for (const clip of nextClips) {
+        URL.revokeObjectURL(clip.url);
+      }
+
+      const message =
+        caughtError instanceof Error
+          ? caughtError.message
+          : "Failed to load one or more videos.";
+      setError(message);
+    } finally {
+      setIsIngesting(false);
+    }
+  }
+
+  async function handleFileInput(event: ChangeEvent<HTMLInputElement>): Promise<void> {
+    await addVideos(event.target.files);
+    event.target.value = "";
+  }
+
+  async function handleDrop(event: ReactDragEvent<HTMLElement>): Promise<void> {
+    event.preventDefault();
+    event.stopPropagation();
+    setIsDragging(false);
+    await addVideos(event.dataTransfer.files);
+  }
+
+  function handleDragOver(event: ReactDragEvent<HTMLElement>): void {
+    event.preventDefault();
+    event.stopPropagation();
+    setIsDragging(true);
+  }
+
+  function handleDragLeave(event: ReactDragEvent<HTMLElement>): void {
+    event.preventDefault();
+    event.stopPropagation();
+    setIsDragging(false);
+  }
+
+  function removeClip(id: string): void {
+    const clip = clips.find((item) => item.id === id);
+    if (!clip) {
+      return;
+    }
+
+    URL.revokeObjectURL(clip.url);
+
+    const nextClips = clips.filter((item) => item.id !== id);
+    const nextTimeline = timelineItems.filter((item) => item.sourceClipId !== id);
+
+    setClips(nextClips);
+    setTimelineItems(nextTimeline);
+    resetTimelineWindow(timelineDurationFromItems(nextTimeline));
+  }
+
+  function clearQueue(): void {
+    for (const clip of clips) {
+      URL.revokeObjectURL(clip.url);
+    }
+
+    setClips([]);
+    setTimelineItems([]);
+    resetTimelineWindow(0);
+    setError(null);
+    setExportProgress(0);
+    setExportStage(null);
+    setDraggingTimelineItemId(null);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  }
+
+  function seekToEditedPosition(targetSec: number, autoPlay: boolean): void {
+    if (editedSegments.length === 0) {
+      return;
+    }
+
+    const upperBound = Math.max(0, editedDurationSec - 0.0001);
+    const clamped = clamp(targetSec, 0, upperBound);
+    const nextIndex = findSegmentIndex(editedSegments, clamped);
+    if (nextIndex < 0) {
+      return;
+    }
+
+    const nextSegment = editedSegments[nextIndex];
+    const sourceTime = nextSegment.sourceStart + (clamped - nextSegment.editedStart);
+
+    setEditedPositionSec(clamped);
+
+    const currentSegment = editedSegments[currentSegmentIndex];
+    const sameClip = currentSegment && currentSegment.clipId === nextSegment.clipId;
+    const player = videoRef.current;
+
+    if (sameClip && player) {
+      setCurrentSegmentIndex(nextIndex);
+      player.currentTime = clamp(
+        sourceTime,
+        nextSegment.sourceStart,
+        Math.max(nextSegment.sourceStart, nextSegment.sourceEnd - 0.0001)
+      );
+      if (autoPlay) {
+        void player.play().catch(() => setIsPlaying(false));
+      }
+      return;
+    }
+
+    pendingSeekRef.current = { sourceTime, autoPlay };
+    setCurrentSegmentIndex(nextIndex);
+  }
+
+  function seekToTimelinePosition(rawPositionSec: number, autoPlay: boolean): void {
+    if (editedSegments.length === 0) {
+      return;
+    }
+
+    const boundedRaw = clamp(rawPositionSec, trimStartSec, trimEndSec);
+    const targetEdited = clamp(boundedRaw - trimStartSec, 0, editedDurationSec);
+    seekToEditedPosition(targetEdited, autoPlay);
+  }
+
+  function handlePlayerLoadedMetadata(): void {
+    const player = videoRef.current;
+    const segment = editedSegments[currentSegmentIndex];
+    if (!player || !segment) {
+      return;
+    }
+
+    const pendingSeek = pendingSeekRef.current;
+    const fallbackSourceTime =
+      segment.sourceStart +
+      clamp(editedPositionSec - segment.editedStart, 0, segment.sourceEnd - segment.sourceStart);
+    const targetSourceTime = pendingSeek ? pendingSeek.sourceTime : fallbackSourceTime;
+
+    player.currentTime = clamp(
+      targetSourceTime,
+      segment.sourceStart,
+      Math.max(segment.sourceStart, segment.sourceEnd - 0.0001)
+    );
+
+    if (pendingSeek?.autoPlay) {
+      void player.play().catch(() => setIsPlaying(false));
+    }
+
+    pendingSeekRef.current = null;
+  }
+
+  function handlePlayerTimeUpdate(): void {
+    const player = videoRef.current;
+    const segment = editedSegments[currentSegmentIndex];
+    if (!player || !segment) {
+      return;
+    }
+
+    const timelineTime = segment.editedStart + (player.currentTime - segment.sourceStart);
+    setEditedPositionSec(clamp(timelineTime, segment.editedStart, segment.editedEnd));
+
+    if (player.currentTime < segment.sourceEnd - SEGMENT_END_EPSILON) {
+      return;
+    }
+
+    if (currentSegmentIndex >= editedSegments.length - 1) {
+      setEditedPositionSec(editedDurationSec);
+      setIsPlaying(false);
+      return;
+    }
+
+    const nextIndex = currentSegmentIndex + 1;
+    const nextSegment = editedSegments[nextIndex];
+
+    if (nextSegment.clipId === segment.clipId) {
+      setCurrentSegmentIndex(nextIndex);
+      player.currentTime = nextSegment.sourceStart;
+      if (isPlaying) {
+        void player.play().catch(() => setIsPlaying(false));
+      }
+      return;
+    }
+
+    pendingSeekRef.current = {
+      sourceTime: nextSegment.sourceStart,
+      autoPlay: isPlaying
+    };
+    setCurrentSegmentIndex(nextIndex);
+  }
+
+  async function togglePlayPause(): Promise<void> {
+    const player = videoRef.current;
+    if (!player || editedSegments.length === 0) {
+      return;
+    }
+
+    if (!isPlaying) {
+      if (editedPositionSec >= editedDurationSec - SEGMENT_END_EPSILON) {
+        seekToEditedPosition(0, false);
+      }
+
+      try {
+        await player.play();
+      } catch {
+        setError("Unable to start playback. Interact with the page and try again.");
+      }
+      return;
+    }
+
+    player.pause();
+  }
+
+  function splitTimelineAt(rawPositionSec: number): void {
+    if (timelineDisplayItems.length === 0 || timelineDurationSec <= 0) {
+      return;
+    }
+
+    const bounded = clamp(rawPositionSec, 0, timelineDurationSec);
+    const target = timelineDisplayItems.find(
+      (item) =>
+        bounded > item.timelineStart + MIN_EDIT_GAP_SEC &&
+        bounded < item.timelineEnd - MIN_EDIT_GAP_SEC
+    );
+
+    if (!target) {
+      setError("Place the razor inside a timeline piece (not on an edge).");
+      return;
+    }
+
+    const splitSource = target.sourceStart + (bounded - target.timelineStart);
+    const leftId = makeId();
+    const rightId = makeId();
+
+    setTimelineItems((previous) => {
+      const index = previous.findIndex((item) => item.id === target.id);
+      if (index < 0) {
+        return previous;
+      }
+
+      const leftPiece: TimelineItem = {
+        id: leftId,
+        sourceClipId: target.sourceClipId,
+        sourceStart: target.sourceStart,
+        sourceEnd: splitSource
+      };
+      const rightPiece: TimelineItem = {
+        id: rightId,
+        sourceClipId: target.sourceClipId,
+        sourceStart: splitSource,
+        sourceEnd: target.sourceEnd
+      };
+
+      return [
+        ...previous.slice(0, index),
+        leftPiece,
+        rightPiece,
+        ...previous.slice(index + 1)
+      ];
+    });
+
+    setSelectedTimelineItemId(rightId);
+    setError(null);
+  }
+
+  function handleTimelineSegmentClick(
+    event: ReactMouseEvent<HTMLButtonElement>,
+    item: TimelineDisplayItem
+  ): void {
+    if (isBusy) {
+      return;
+    }
+
+    const rect = event.currentTarget.getBoundingClientRect();
+    const ratio = rect.width <= 0 ? 0 : clamp((event.clientX - rect.left) / rect.width, 0, 1);
+    const rawPosition = item.timelineStart + item.duration * ratio;
+
+    setSelectedTimelineItemId(item.id);
+
+    if (timelineTool === "razor") {
+      splitTimelineAt(rawPosition);
+      return;
+    }
+
+    seekToTimelinePosition(rawPosition, isPlaying);
+  }
+
+  function handleTrimWindowPointerDown(event: ReactPointerEvent<HTMLDivElement>): void {
+    if (event.button !== 0 || isBusy || timelineDurationSec <= 0 || trimEndSec <= trimStartSec) {
+      return;
+    }
+
+    const rail = trimRangeShellRef.current;
+    if (!rail) {
+      return;
+    }
+
+    const rect = rail.getBoundingClientRect();
+    if (rect.width <= 0) {
+      return;
+    }
+
+    event.preventDefault();
+    trimWindowDragRef.current = {
+      pointerId: event.pointerId,
+      startClientX: event.clientX,
+      railWidthPx: rect.width,
+      initialStartSec: trimStartSec,
+      initialEndSec: trimEndSec
+    };
+    setIsDraggingTrimWindow(true);
+  }
+
+  function handlePlayheadPointerDown(event: ReactPointerEvent<HTMLDivElement>): void {
+    if (event.button !== 0 || isBusy || timelineDurationSec <= 0 || editedSegments.length === 0) {
+      return;
+    }
+
+    const rail = trimRangeShellRef.current;
+    if (!rail) {
+      return;
+    }
+
+    const rect = rail.getBoundingClientRect();
+    if (rect.width <= 0) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    videoRef.current?.pause();
+    setIsPlaying(false);
+
+    playheadDragRef.current = {
+      pointerId: event.pointerId,
+      railLeftPx: rect.left,
+      railWidthPx: rect.width
+    };
+    setIsDraggingPlayhead(true);
+
+    const ratio = clamp((event.clientX - rect.left) / rect.width, 0, 1);
+    const rawPosition = ratio * timelineDurationSec;
+    seekToTimelinePosition(rawPosition, false);
+  }
+
+  function handleTimelineItemDragStart(
+    event: ReactDragEvent<HTMLButtonElement>,
+    itemId: string
+  ): void {
+    if (isBusy) {
+      event.preventDefault();
+      return;
+    }
+
+    setDraggingTimelineItemId(itemId);
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", itemId);
+  }
+
+  function handleTimelineItemDragOver(event: ReactDragEvent<HTMLButtonElement>): void {
+    if (!draggingTimelineItemId || isBusy) {
+      return;
+    }
+
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+  }
+
+  function handleTimelineItemDrop(
+    event: ReactDragEvent<HTMLButtonElement>,
+    targetId: string
+  ): void {
+    if (!draggingTimelineItemId || isBusy) {
+      return;
+    }
+
+    event.preventDefault();
+    const rect = event.currentTarget.getBoundingClientRect();
+    const placeAfter = event.clientX > rect.left + rect.width / 2;
+
+    setTimelineItems((previous) =>
+      moveTimelineItem(previous, draggingTimelineItemId, targetId, placeAfter)
+    );
+    setDraggingTimelineItemId(null);
+  }
+
+  function handleTimelineItemDragEnd(): void {
+    setDraggingTimelineItemId(null);
+  }
+
+  function removeSelectedTimelinePiece(): void {
+    if (!selectedTimelineItemId || isBusy) {
+      return;
+    }
+
+    setTimelineItems((previous) => previous.filter((item) => item.id !== selectedTimelineItemId));
+    setSelectedTimelineItemId(null);
+  }
+
+  async function handleExport(): Promise<void> {
+    if (editedSegments.length === 0 || isBusy) {
+      return;
+    }
+
+    setIsExporting(true);
+    setExportStage("loading-core");
+    setExportProgress(0);
+    setError(null);
+
+    try {
+      const exportSegments = editedSegments.map((segment) => {
+        const clip = clipById.get(segment.clipId);
+        if (!clip) {
+          throw new Error("A source clip referenced by the timeline could not be found.");
+        }
+
+        return {
+          file: clip.file,
+          startSec: segment.sourceStart,
+          endSec: segment.sourceEnd
+        };
+      });
+
+      const blob = await exportEditedTimeline(exportSegments, {
+        onStageChange: (stage) => setExportStage(stage),
+        onProgress: (value) => setExportProgress(value)
+      });
+
+      const downloadUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = downloadUrl;
+      anchor.download = "edited-video.mp4";
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+
+      window.setTimeout(() => {
+        URL.revokeObjectURL(downloadUrl);
+      }, 1000);
+
+      setExportProgress(1);
+      setExportStage("finalizing");
+    } catch (caughtError) {
+      const message =
+        caughtError instanceof Error
+          ? caughtError.message
+          : "Export failed unexpectedly.";
+      setError(message);
+    } finally {
+      setIsExporting(false);
+    }
+  }
+
+  return (
+    <main className="app-shell">
+      <header className="hero">
+        <p className="eyebrow">Timeline Editor</p>
+        <h1>Browser Video Editor</h1>
+        <p className="hero-copy">
+          Add one or more videos, edit on a single timeline, then export once.
+        </p>
+      </header>
+
+      <section
+        className={`dropzone ${isDragging ? "dragging" : ""}`}
+        onDrop={(event) => void handleDrop(event)}
+        onDragOver={handleDragOver}
+        onDragEnter={handleDragOver}
+        onDragLeave={handleDragLeave}
+      >
+        <div className="dropzone-content">
+          <p className="dropzone-title">Drag and drop videos</p>
+          <p className="dropzone-subtitle">
+            Multiple videos are concatenated by default in timeline order.
+          </p>
+          <button
+            className="button secondary"
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={isBusy}
+          >
+            {isIngesting ? "Loading..." : "Browse Files"}
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="video/*"
+            multiple
+            onChange={(event) => void handleFileInput(event)}
+            hidden
+          />
+        </div>
+      </section>
+
+      {error && <p className="status error">{error}</p>}
+
+      <section className="queue-panel">
+        <div className="queue-header">
+          <p className="queue-title">Source Queue ({clips.length})</p>
+          <button
+            className="button ghost"
+            type="button"
+            onClick={clearQueue}
+            disabled={clips.length === 0 || isBusy}
+          >
+            Clear Queue
+          </button>
+        </div>
+
+        {clips.length === 0 ? (
+          <p className="queue-empty">No clips yet.</p>
+        ) : (
+          <ul className="queue-list">
+            {clips.map((clip, index) => (
+              <li
+                key={clip.id}
+                className="queue-item"
+              >
+                <div className="queue-select">
+                  <span className="queue-order">{index + 1}</span>
+                  <span className="queue-name">{clip.file.name}</span>
+                  <span className="queue-size">
+                    {formatDuration(clip.duration)} · {formatFileSize(clip.file.size)}
+                  </span>
+                </div>
+                <button
+                  className="button ghost tiny"
+                  type="button"
+                  onClick={() => removeClip(clip.id)}
+                  disabled={isBusy}
+                >
+                  Remove
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <section className="preview-panel">
+        <div className="preview-frame">
+          {activeClip ? (
+            <video
+              ref={videoRef}
+              src={activeClip.url}
+              onLoadedMetadata={handlePlayerLoadedMetadata}
+              onTimeUpdate={handlePlayerTimeUpdate}
+              onPlay={() => setIsPlaying(true)}
+              onPause={() => setIsPlaying(false)}
+              playsInline
+            />
+          ) : (
+            <div className="preview-empty">
+              <p>Add videos to start editing.</p>
+            </div>
+          )}
+        </div>
+      </section>
+
+      <section className="edit-panel">
+        <p className="queue-title">Timeline Controls</p>
+
+        {timelineDurationSec <= 0 ? (
+          <p className="queue-empty">Load clips to edit the timeline.</p>
+        ) : (
+          <>
+            <div className="timeline-toolbar">
+              <button
+                className="button primary"
+                type="button"
+                onClick={() => void togglePlayPause()}
+                disabled={editedSegments.length === 0}
+              >
+                {isPlaying ? "Pause" : "Play"}
+              </button>
+
+              <p className="timeline-readout">
+                {formatDuration(editedPositionSec)} / {formatDuration(editedDurationSec)}
+              </p>
+
+              <div className="timeline-tools">
+                <button
+                  className={`button ghost tiny${timelineTool === "select" ? " active" : ""}`}
+                  type="button"
+                  onClick={() => setTimelineTool("select")}
+                  disabled={isBusy}
+                >
+                  Pointer
+                </button>
+                <button
+                  className={`button ghost tiny${timelineTool === "razor" ? " active" : ""}`}
+                  type="button"
+                  onClick={() => setTimelineTool("razor")}
+                  disabled={isBusy}
+                >
+                  Razor
+                </button>
+                <button
+                  className="button ghost tiny"
+                  type="button"
+                  onClick={removeSelectedTimelinePiece}
+                  disabled={isBusy || !selectedTimelineItemId}
+                >
+                  Delete Piece
+                </button>
+              </div>
+            </div>
+
+            <div className="timeline-visual">
+              <div
+                className="timeline-track-shell"
+                ref={trimRangeShellRef}
+              >
+                <div
+                  className="timeline-mask timeline-mask-start"
+                  style={{ width: `${trimStartPercent}%` }}
+                />
+                <div
+                  className="timeline-mask timeline-mask-end"
+                  style={{ width: `${trimRightPercent}%` }}
+                />
+
+                <div className={`timeline-track${timelineTool === "razor" ? " razor" : ""}`}>
+                  {timelineDisplayItems.map((item, index) => {
+                    const width =
+                      timelineDurationSec > 0 ? (item.duration / timelineDurationSec) * 100 : 0;
+                    const clip = clipById.get(item.sourceClipId);
+                    const isSelected = item.id === selectedTimelineItemId;
+                    const isDraggingItem = item.id === draggingTimelineItemId;
+
+                    return (
+                      <button
+                        key={item.id}
+                        className={`timeline-segment${isSelected ? " selected" : ""}${
+                          isDraggingItem ? " dragging" : ""
+                        }`}
+                        style={{ width: `${width}%` }}
+                        type="button"
+                        onClick={(event) => handleTimelineSegmentClick(event, item)}
+                        onDragStart={(event) => handleTimelineItemDragStart(event, item.id)}
+                        onDragOver={handleTimelineItemDragOver}
+                        onDrop={(event) => handleTimelineItemDrop(event, item.id)}
+                        onDragEnd={handleTimelineItemDragEnd}
+                        draggable={!isBusy}
+                        disabled={isBusy}
+                        title={`${clip?.file.name ?? "Clip"} · ${formatSecondsLabel(
+                          item.sourceStart
+                        )} -> ${formatSecondsLabel(item.sourceEnd)}`}
+                      >
+                        <span className="timeline-segment-label">{index + 1}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <div
+                  className={`timeline-playhead${isDraggingPlayhead ? " dragging" : ""}`}
+                  style={{ left: `${playheadPercent}%` }}
+                  onPointerDown={handlePlayheadPointerDown}
+                  title="Drag playhead"
+                />
+
+                <div
+                  className="trim-range-window"
+                  style={{
+                    left: `${trimStartPercent}%`,
+                    right: `${trimRightPercent}%`
+                  }}
+                />
+
+                <div
+                  className={`trim-window-grabber${isDraggingTrimWindow ? " dragging" : ""}`}
+                  style={{ left: `${(trimStartPercent + trimEndPercent) / 2}%` }}
+                  onPointerDown={handleTrimWindowPointerDown}
+                  title="Drag trim window"
+                />
+
+                <input
+                  className="trim-range trim-range-start"
+                  type="range"
+                  min={0}
+                  max={timelineDurationSec}
+                  step={0.05}
+                  value={clamp(trimStartSec, 0, timelineDurationSec)}
+                  onChange={(event) => {
+                    const value = Number(event.target.value);
+                    setTrimStartSec(
+                      clamp(value, 0, Math.max(0, trimEndSec - minTrimGapSec))
+                    );
+                  }}
+                  disabled={isBusy}
+                  aria-label="Trim start"
+                />
+
+                <input
+                  className="trim-range trim-range-end"
+                  type="range"
+                  min={0}
+                  max={timelineDurationSec}
+                  step={0.05}
+                  value={clamp(trimEndSec, 0, timelineDurationSec)}
+                  onChange={(event) => {
+                    const value = Number(event.target.value);
+                    setTrimEndSec(
+                      clamp(
+                        value,
+                        Math.min(timelineDurationSec, trimStartSec + minTrimGapSec),
+                        timelineDurationSec
+                      )
+                    );
+                  }}
+                  disabled={isBusy}
+                  aria-label="Trim end"
+                />
+              </div>
+
+              <div className="trim-rail-values">
+                <span>In {formatSecondsLabel(trimStartSec)}</span>
+                <span>Out {formatSecondsLabel(trimEndSec)}</span>
+              </div>
+
+              {selectedTimelineItem ? (
+                <p className="hint">
+                  Selected piece: {clipById.get(selectedTimelineItem.sourceClipId)?.file.name ?? "Unknown"} · {" "}
+                  {formatSecondsLabel(selectedTimelineItem.sourceStart)} - {formatSecondsLabel(selectedTimelineItem.sourceEnd)}
+                </p>
+              ) : (
+                <p className="hint">
+                  Click pieces to seek. Use Razor to split. Drag pieces left/right to reorder.
+                </p>
+              )}
+            </div>
+
+            <div className="export-row">
+              <button
+                className="button primary"
+                type="button"
+                onClick={() => void handleExport()}
+                disabled={isBusy || editedSegments.length === 0}
+              >
+                {isExporting ? "Exporting..." : "Export Edited Video"}
+              </button>
+            </div>
+
+            {(isExporting || exportStage) && (
+              <div className="progress-block">
+                <p className="progress-label">
+                  {exportStage ? exportStageLabel(exportStage) : "Working..."}
+                </p>
+                <div className="progress-bar">
+                  <span
+                    style={{
+                      width: `${Math.round(Math.min(1, Math.max(0, exportProgress)) * 100)}%`
+                    }}
+                  />
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </section>
+    </main>
+  );
+}
+
+export default App;
