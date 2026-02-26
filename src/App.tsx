@@ -29,6 +29,7 @@ interface TimelineItem {
   sourceClipId: string;
   sourceStart: number;
   sourceEnd: number;
+  speed: number;
 }
 
 interface TimelineDisplayItem extends TimelineItem {
@@ -44,6 +45,7 @@ interface EditedSegment {
   clipId: string;
   sourceStart: number;
   sourceEnd: number;
+  speed: number;
   timelineStart: number;
   timelineEnd: number;
   editedStart: number;
@@ -82,6 +84,12 @@ const EXPORT_FORMAT_OPTIONS: Array<{ value: ExportFormat; label: string }> = [
 
 const MIN_EDIT_GAP_SEC = 0.1;
 const SEGMENT_END_EPSILON = 0.03;
+const MIN_SEGMENT_SPEED = 0.001;
+const MAX_SEGMENT_SPEED = 1000;
+const MIN_SEGMENT_SPEED_LOG = Math.log10(MIN_SEGMENT_SPEED);
+const MAX_SEGMENT_SPEED_LOG = Math.log10(MAX_SEGMENT_SPEED);
+const MIN_PREVIEW_PLAYBACK_RATE = 0.0625;
+const MAX_PREVIEW_PLAYBACK_RATE = 16;
 
 function makeId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -119,6 +127,26 @@ function formatSecondsLabel(seconds: number): string {
 function formatFileSize(bytes: number): string {
   const sizeMb = bytes / (1024 * 1024);
   return `${sizeMb.toFixed(2)} MB`;
+}
+
+function clampSpeed(value: number): number {
+  return clamp(value, MIN_SEGMENT_SPEED, MAX_SEGMENT_SPEED);
+}
+
+function clampPreviewPlaybackRate(value: number): number {
+  return clamp(value, MIN_PREVIEW_PLAYBACK_RATE, MAX_PREVIEW_PLAYBACK_RATE);
+}
+
+function speedToLogSliderValue(speed: number): number {
+  return clamp(Math.log10(clampSpeed(speed)), MIN_SEGMENT_SPEED_LOG, MAX_SEGMENT_SPEED_LOG);
+}
+
+function logSliderValueToSpeed(value: number): number {
+  return clampSpeed(10 ** clamp(value, MIN_SEGMENT_SPEED_LOG, MAX_SEGMENT_SPEED_LOG));
+}
+
+function formatSpeedLabel(speed: number): string {
+  return Number(clampSpeed(speed).toPrecision(6)).toString();
 }
 
 function parsePositiveIntegerInput(value: string): number | null {
@@ -182,7 +210,11 @@ async function loadVideoMetadata(
 }
 
 function timelineDurationFromItems(items: TimelineItem[]): number {
-  return items.reduce((sum, item) => sum + Math.max(0, item.sourceEnd - item.sourceStart), 0);
+  return items.reduce((sum, item) => {
+    const sourceDuration = Math.max(0, item.sourceEnd - item.sourceStart);
+    const speed = clampSpeed(item.speed);
+    return sum + sourceDuration / speed;
+  }, 0);
 }
 
 function buildTimelineDisplayItems(items: TimelineItem[]): TimelineDisplayItem[] {
@@ -190,13 +222,16 @@ function buildTimelineDisplayItems(items: TimelineItem[]): TimelineDisplayItem[]
   let offset = 0;
 
   for (const [index, item] of items.entries()) {
-    const duration = Math.max(0, item.sourceEnd - item.sourceStart);
+    const sourceDuration = Math.max(0, item.sourceEnd - item.sourceStart);
+    const speed = clampSpeed(item.speed);
+    const duration = sourceDuration / speed;
     if (duration <= 0.001) {
       continue;
     }
 
     displayItems.push({
       ...item,
+      speed,
       index,
       duration,
       timelineStart: offset,
@@ -235,16 +270,17 @@ function buildEditedSegments(
       continue;
     }
 
-    const sourceStart = item.sourceStart + (overlapStart - item.timelineStart);
-    const sourceEnd = item.sourceStart + (overlapEnd - item.timelineStart);
+    const sourceStart = item.sourceStart + (overlapStart - item.timelineStart) * item.speed;
+    const sourceEnd = item.sourceStart + (overlapEnd - item.timelineStart) * item.speed;
     const duration = overlapEnd - overlapStart;
 
     editedSegments.push({
-      id: `${item.id}:${sourceStart.toFixed(5)}:${sourceEnd.toFixed(5)}`,
+      id: `${item.id}:${sourceStart.toFixed(5)}:${sourceEnd.toFixed(5)}:${item.speed.toFixed(4)}`,
       timelineItemId: item.id,
       clipId: item.sourceClipId,
       sourceStart,
       sourceEnd,
+      speed: item.speed,
       timelineStart: overlapStart,
       timelineEnd: overlapEnd,
       editedStart: editedOffset,
@@ -332,6 +368,7 @@ function App() {
 
   const [isDraggingTrimWindow, setIsDraggingTrimWindow] = useState(false);
   const [isDraggingPlayhead, setIsDraggingPlayhead] = useState(false);
+  const [selectedSpeedInput, setSelectedSpeedInput] = useState("");
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -434,12 +471,28 @@ function App() {
   const selectedTimelineItem = selectedTimelineItemId
     ? timelineDisplayItems.find((item) => item.id === selectedTimelineItemId) ?? null
     : null;
+  const selectedSpeedSliderValue = selectedTimelineItem
+    ? speedToLogSliderValue(selectedTimelineItem.speed)
+    : 0;
 
   const isBusy = isIngesting || isExporting;
   const autoResolutionLabel =
     largestClipResolution.area > 0
       ? `${largestClipResolution.width} x ${largestClipResolution.height}`
       : "none";
+
+  function applySegmentPlaybackRate(segment: EditedSegment | null): void {
+    const player = videoRef.current;
+    if (!player || !segment) {
+      return;
+    }
+    const targetRate = clampPreviewPlaybackRate(segment.speed);
+    try {
+      player.playbackRate = targetRate;
+    } catch {
+      player.playbackRate = 1;
+    }
+  }
 
   useEffect(() => {
     clipsRef.current = clips;
@@ -465,6 +518,14 @@ function App() {
     }
   }, [draggingTimelineItemId, timelineItems]);
 
+  useEffect(() => {
+    if (!selectedTimelineItem) {
+      setSelectedSpeedInput("");
+      return;
+    }
+    setSelectedSpeedInput(formatSpeedLabel(selectedTimelineItem.speed));
+  }, [selectedTimelineItemId, selectedTimelineItem?.speed]);
+
   // Reposition playback when timeline structure changes.
   useEffect(() => {
     if (editedSegments.length === 0) {
@@ -480,7 +541,8 @@ function App() {
     const clampedPosition = clamp(editedPositionSec, 0, upperBound);
     const nextSegmentIndex = Math.max(0, findSegmentIndex(editedSegments, clampedPosition));
     const nextSegment = editedSegments[nextSegmentIndex];
-    const sourceTime = nextSegment.sourceStart + (clampedPosition - nextSegment.editedStart);
+    const sourceTime =
+      nextSegment.sourceStart + (clampedPosition - nextSegment.editedStart) * nextSegment.speed;
 
     if (isPlaying) {
       videoRef.current?.pause();
@@ -491,6 +553,20 @@ function App() {
     }
     if (currentSegmentIndex !== nextSegmentIndex) {
       setCurrentSegmentIndex(nextSegmentIndex);
+    }
+
+    const player = videoRef.current;
+    const currentSegment = editedSegments[currentSegmentIndex] ?? null;
+    const sameClip = currentSegment && currentSegment.clipId === nextSegment.clipId;
+    if (player && sameClip) {
+      applySegmentPlaybackRate(nextSegment);
+      player.currentTime = clamp(
+        sourceTime,
+        nextSegment.sourceStart,
+        Math.max(nextSegment.sourceStart, nextSegment.sourceEnd - 0.0001)
+      );
+      pendingSeekRef.current = null;
+      return;
     }
 
     pendingSeekRef.current = { sourceTime, autoPlay: false };
@@ -696,7 +772,8 @@ function App() {
         id: makeId(),
         sourceClipId: clip.id,
         sourceStart: 0,
-        sourceEnd: clip.duration
+        sourceEnd: clip.duration,
+        speed: 1
       }));
 
       const combinedClips = [...clips, ...nextClips];
@@ -791,7 +868,8 @@ function App() {
     }
 
     const nextSegment = editedSegments[nextIndex];
-    const sourceTime = nextSegment.sourceStart + (clamped - nextSegment.editedStart);
+    const sourceTime =
+      nextSegment.sourceStart + (clamped - nextSegment.editedStart) * nextSegment.speed;
 
     setEditedPositionSec(clamped);
 
@@ -801,6 +879,7 @@ function App() {
 
     if (sameClip && player) {
       setCurrentSegmentIndex(nextIndex);
+      applySegmentPlaybackRate(nextSegment);
       player.currentTime = clamp(
         sourceTime,
         nextSegment.sourceStart,
@@ -836,9 +915,11 @@ function App() {
     const pendingSeek = pendingSeekRef.current;
     const fallbackSourceTime =
       segment.sourceStart +
-      clamp(editedPositionSec - segment.editedStart, 0, segment.sourceEnd - segment.sourceStart);
+      clamp(editedPositionSec - segment.editedStart, 0, segment.editedEnd - segment.editedStart) *
+        segment.speed;
     const targetSourceTime = pendingSeek ? pendingSeek.sourceTime : fallbackSourceTime;
 
+    applySegmentPlaybackRate(segment);
     player.currentTime = clamp(
       targetSourceTime,
       segment.sourceStart,
@@ -859,7 +940,8 @@ function App() {
       return;
     }
 
-    const timelineTime = segment.editedStart + (player.currentTime - segment.sourceStart);
+    const timelineTime =
+      segment.editedStart + (player.currentTime - segment.sourceStart) / segment.speed;
     setEditedPositionSec(clamp(timelineTime, segment.editedStart, segment.editedEnd));
 
     if (player.currentTime < segment.sourceEnd - SEGMENT_END_EPSILON) {
@@ -877,6 +959,7 @@ function App() {
 
     if (nextSegment.clipId === segment.clipId) {
       setCurrentSegmentIndex(nextIndex);
+      applySegmentPlaybackRate(nextSegment);
       player.currentTime = nextSegment.sourceStart;
       if (isPlaying) {
         void player.play().catch(() => setIsPlaying(false));
@@ -893,9 +976,12 @@ function App() {
 
   async function togglePlayPause(): Promise<void> {
     const player = videoRef.current;
-    if (!player || editedSegments.length === 0) {
+    const segment = editedSegments[currentSegmentIndex] ?? null;
+    if (!player || editedSegments.length === 0 || !segment) {
       return;
     }
+
+    applySegmentPlaybackRate(segment);
 
     if (!isPlaying) {
       if (editedPositionSec >= editedDurationSec - SEGMENT_END_EPSILON) {
@@ -930,7 +1016,7 @@ function App() {
       return;
     }
 
-    const splitSource = target.sourceStart + (bounded - target.timelineStart);
+    const splitSource = target.sourceStart + (bounded - target.timelineStart) * target.speed;
     const leftId = makeId();
     const rightId = makeId();
 
@@ -944,13 +1030,15 @@ function App() {
         id: leftId,
         sourceClipId: target.sourceClipId,
         sourceStart: target.sourceStart,
-        sourceEnd: splitSource
+        sourceEnd: splitSource,
+        speed: target.speed
       };
       const rightPiece: TimelineItem = {
         id: rightId,
         sourceClipId: target.sourceClipId,
         sourceStart: splitSource,
-        sourceEnd: target.sourceEnd
+        sourceEnd: target.sourceEnd,
+        speed: target.speed
       };
 
       return [
@@ -1100,6 +1188,48 @@ function App() {
     setSelectedTimelineItemId(null);
   }
 
+  function setSelectedTimelineSpeed(nextSpeed: number): void {
+    if (!selectedTimelineItemId || isBusy) {
+      return;
+    }
+
+    const clampedSpeed = clampSpeed(nextSpeed);
+    setTimelineItems((previous) =>
+      previous.map((item) =>
+        item.id === selectedTimelineItemId
+          ? {
+              ...item,
+              speed: clampedSpeed
+            }
+          : item
+      )
+    );
+    setError(null);
+  }
+
+  function handleSelectedSpeedInputChange(value: string): void {
+    setSelectedSpeedInput(value);
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      return;
+    }
+    setSelectedTimelineSpeed(parsed);
+  }
+
+  function commitSelectedSpeedInput(): void {
+    if (!selectedTimelineItem) {
+      return;
+    }
+    const parsed = Number(selectedSpeedInput);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      setSelectedSpeedInput(formatSpeedLabel(selectedTimelineItem.speed));
+      return;
+    }
+    const clampedSpeed = clampSpeed(parsed);
+    setSelectedTimelineSpeed(clampedSpeed);
+    setSelectedSpeedInput(formatSpeedLabel(clampedSpeed));
+  }
+
   async function handleExport(): Promise<void> {
     if (editedSegments.length === 0 || isBusy) {
       return;
@@ -1155,6 +1285,7 @@ function App() {
           file: clip.file,
           startSec: segment.sourceStart,
           endSec: segment.sourceEnd,
+          speed: segment.speed,
           width: clip.width,
           height: clip.height
         };
@@ -1393,7 +1524,7 @@ function App() {
                         disabled={isBusy}
                         title={`${clip?.file.name ?? "Clip"} · ${formatSecondsLabel(
                           item.sourceStart
-                        )} -> ${formatSecondsLabel(item.sourceEnd)}`}
+                        )} -> ${formatSecondsLabel(item.sourceEnd)} · ${formatSpeedLabel(item.speed)}x`}
                       >
                         <span className="timeline-segment-label">{index + 1}</span>
                       </button>
@@ -1468,10 +1599,91 @@ function App() {
               </div>
 
               {selectedTimelineItem ? (
-                <p className="hint">
-                  Selected piece: {clipById.get(selectedTimelineItem.sourceClipId)?.file.name ?? "Unknown"} · {" "}
-                  {formatSecondsLabel(selectedTimelineItem.sourceStart)} - {formatSecondsLabel(selectedTimelineItem.sourceEnd)}
-                </p>
+                <div className="piece-speed-panel">
+                  <p className="hint">
+                    Selected piece: {clipById.get(selectedTimelineItem.sourceClipId)?.file.name ?? "Unknown"} ·{" "}
+                    {formatSecondsLabel(selectedTimelineItem.sourceStart)} - {formatSecondsLabel(selectedTimelineItem.sourceEnd)}
+                  </p>
+                  <div className="piece-speed-header">
+                    <span>Speed</span>
+                    <strong>{formatSpeedLabel(selectedTimelineItem.speed)}x</strong>
+                  </div>
+                  <label className="piece-speed-input-row">
+                    <span>Precise value</span>
+                    <div className="piece-speed-input-wrap">
+                      <input
+                        className="time-input piece-speed-input"
+                        type="number"
+                        min={MIN_SEGMENT_SPEED}
+                        max={MAX_SEGMENT_SPEED}
+                        step="any"
+                        value={selectedSpeedInput}
+                        onChange={(event) => handleSelectedSpeedInputChange(event.target.value)}
+                        onBlur={commitSelectedSpeedInput}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter") {
+                            event.preventDefault();
+                            commitSelectedSpeedInput();
+                            (event.currentTarget as HTMLInputElement).blur();
+                          }
+                        }}
+                        disabled={isBusy}
+                        aria-label="Selected piece speed input"
+                      />
+                      <span>x</span>
+                    </div>
+                  </label>
+                  <input
+                    className="piece-speed-slider"
+                    type="range"
+                    min={MIN_SEGMENT_SPEED_LOG}
+                    max={MAX_SEGMENT_SPEED_LOG}
+                    step={0.01}
+                    value={selectedSpeedSliderValue}
+                    onChange={(event) =>
+                      setSelectedTimelineSpeed(logSliderValueToSpeed(Number(event.target.value)))
+                    }
+                    disabled={isBusy}
+                    aria-label="Selected piece speed"
+                  />
+                  <div className="piece-speed-scale">
+                    <span>{formatSpeedLabel(MIN_SEGMENT_SPEED)}x</span>
+                    <span>1x</span>
+                    <span>{formatSpeedLabel(MAX_SEGMENT_SPEED)}x</span>
+                  </div>
+                  <p className="hint">Log slider: 1x is centered.</p>
+                  <p className="hint">
+                    Preview rate is clamped by the browser ({MIN_PREVIEW_PLAYBACK_RATE}x to {MAX_PREVIEW_PLAYBACK_RATE}x),
+                    but export still uses the exact value.
+                  </p>
+                  <div className="piece-speed-presets">
+                    {[0.01, 0.1, 0.5, 1, 2, 10, 100].map((preset) => (
+                      <button
+                        key={preset}
+                        className={`button ghost tiny${
+                          Math.abs(selectedTimelineItem.speed - preset) <=
+                          Math.max(0.00001, preset * 0.01)
+                            ? " active"
+                            : ""
+                        }`}
+                        type="button"
+                        onClick={() => setSelectedTimelineSpeed(preset)}
+                        disabled={isBusy}
+                      >
+                        {formatSpeedLabel(preset)}x
+                      </button>
+                    ))}
+                  </div>
+                  <div className="trim-rail-values">
+                    <span>
+                      Source{" "}
+                      {formatSecondsLabel(
+                        Math.max(0, selectedTimelineItem.sourceEnd - selectedTimelineItem.sourceStart)
+                      )}
+                    </span>
+                    <span>Timeline {formatSecondsLabel(selectedTimelineItem.duration)}</span>
+                  </div>
+                </div>
               ) : (
                 <p className="hint">
                   Click pieces to seek. Use Razor to split. Drag pieces left/right to reorder.

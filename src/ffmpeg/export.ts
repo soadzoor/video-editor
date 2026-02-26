@@ -20,6 +20,7 @@ export interface ExportSegment {
   file: File;
   startSec: number;
   endSec: number;
+  speed: number;
   width: number;
   height: number;
 }
@@ -63,6 +64,35 @@ function normalizeOptionalFps(value: number | undefined): number | null {
   }
   const rounded = Math.round(value as number);
   return Math.min(120, Math.max(1, rounded));
+}
+
+function normalizeSpeed(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    return 1;
+  }
+  return Math.min(1000, Math.max(0.001, value));
+}
+
+function isSpeedNeutral(value: number): boolean {
+  return Math.abs(value - 1) <= 0.000001;
+}
+
+function buildAtempoFilter(speed: number): string {
+  const filters: string[] = [];
+  let remaining = speed;
+
+  while (remaining < 0.5 - 0.000001) {
+    filters.push("atempo=0.5");
+    remaining /= 0.5;
+  }
+
+  while (remaining > 2 + 0.000001) {
+    filters.push("atempo=2");
+    remaining /= 2;
+  }
+
+  filters.push(`atempo=${remaining.toFixed(5)}`);
+  return filters.join(",");
 }
 
 function getFormatConfig(format: ExportFormat): ExportFormatConfig {
@@ -130,6 +160,7 @@ export async function exportEditedTimeline(
       ...segment,
       startSec: Math.max(0, segment.startSec),
       endSec: Math.max(0, segment.endSec),
+      speed: normalizeSpeed(segment.speed),
       width: Math.max(0, Math.round(segment.width)),
       height: Math.max(0, Math.round(segment.height))
     }))
@@ -180,10 +211,12 @@ export async function exportEditedTimeline(
   const hasResolutionMismatch = sanitizedSegments.some(
     (segment) => segment.width !== targetWidth || segment.height !== targetHeight
   );
+  const hasSpeedChange = sanitizedSegments.some((segment) => !isSpeedNeutral(segment.speed));
   const shouldNormalize = exportMode === "fit" && hasResolutionMismatch;
   const shouldStretchResize = exportMode === "fast" && hasCustomResolution && hasResolutionMismatch;
   const shouldApplyFps = targetFps !== null;
-  const canUseFastPath = !shouldNormalize && !shouldStretchResize && !shouldApplyFps;
+  const canUseFastPath =
+    !shouldNormalize && !shouldStretchResize && !shouldApplyFps && !hasSpeedChange;
   const baseFilters: string[] = [];
   if (shouldNormalize) {
     baseFilters.push(fitScaleFilter);
@@ -208,6 +241,7 @@ export async function exportEditedTimeline(
     exportFormat,
     hasCustomResolution,
     hasResolutionMismatch,
+    hasSpeedChange,
     targetFps,
     targetWidth,
     targetHeight,
@@ -347,11 +381,10 @@ export async function exportEditedTimeline(
 
     const fallbackNeedsStretch =
       hasResolutionMismatch && exportMode === "fast" && !shouldNormalize && !shouldStretchResize;
-    const reencodeFilters = [...baseFilters];
+    const reencodeBaseFilters = [...baseFilters];
     if (fallbackNeedsStretch) {
-      reencodeFilters.unshift(stretchScaleFilter);
+      reencodeBaseFilters.unshift(stretchScaleFilter);
     }
-    const reencodeVideoFilter = reencodeFilters.length > 0 ? reencodeFilters.join(",") : null;
 
     options.onStageChange?.(
       "processing-reencode",
@@ -361,6 +394,8 @@ export async function exportEditedTimeline(
           ? "Applying export resolution (software encode, may take a while)..."
           : shouldApplyFps
             ? "Applying export FPS (software encode, may take a while)..."
+            : hasSpeedChange
+              ? "Applying speed changes (software encode, may take a while)..."
             : "Re-encoding timeline segments..."
     );
     options.onProgress?.(0.1);
@@ -376,6 +411,15 @@ export async function exportEditedTimeline(
 
       const duration = segment.endSec - segment.startSec;
       const segmentPath = segmentPaths[index];
+      const segmentVideoFilters = [...reencodeBaseFilters];
+      if (!isSpeedNeutral(segment.speed)) {
+        segmentVideoFilters.push(`setpts=PTS/${segment.speed.toFixed(6)}`);
+      }
+      const segmentVideoFilter =
+        segmentVideoFilters.length > 0 ? segmentVideoFilters.join(",") : null;
+      const segmentAudioFilter = !isSpeedNeutral(segment.speed)
+        ? buildAtempoFilter(segment.speed)
+        : null;
       const reencodeArgs: string[] = [
         "-nostdin",
         "-y",
@@ -391,8 +435,12 @@ export async function exportEditedTimeline(
         "0:a:0?"
       ];
 
-      if (reencodeVideoFilter) {
-        reencodeArgs.push("-vf", reencodeVideoFilter);
+      if (segmentVideoFilter) {
+        reencodeArgs.push("-vf", segmentVideoFilter);
+      }
+
+      if (segmentAudioFilter) {
+        reencodeArgs.push("-af", segmentAudioFilter);
       }
 
       reencodeArgs.push(

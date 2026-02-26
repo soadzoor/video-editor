@@ -451,6 +451,69 @@ body {
   color: var(--text-muted);
 }
 
+.piece-speed-panel {
+  display: grid;
+  gap: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 10px;
+  background: rgba(5, 11, 24, 0.35);
+  padding: 10px;
+}
+
+.piece-speed-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 0.82rem;
+  color: var(--text-muted);
+}
+
+.piece-speed-header strong {
+  color: var(--text-main);
+  font-size: 0.9rem;
+}
+
+.piece-speed-input-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.piece-speed-input-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.piece-speed-input {
+  width: 120px;
+  text-align: right;
+}
+
+.piece-speed-slider {
+  width: 100%;
+}
+
+.piece-speed-scale {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.piece-speed-presets {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .timeline-track-shell {
   position: relative;
   min-height: 44px;
