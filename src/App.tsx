@@ -8,7 +8,12 @@ import {
   useRef,
   useState
 } from "react";
-import { exportEditedTimeline, type ExportStage } from "./ffmpeg/export";
+import {
+  exportEditedTimeline,
+  type ExportFormat,
+  type ExportMode,
+  type ExportStage
+} from "./ffmpeg/export";
 
 interface SourceClip {
   id: string;
@@ -66,6 +71,15 @@ interface PlayheadDragState {
 
 type TimelineTool = "select" | "razor";
 
+const EXPORT_FORMAT_OPTIONS: Array<{ value: ExportFormat; label: string }> = [
+  { value: "mp4", label: "MP4 (H.264)" },
+  { value: "mov", label: "MOV (QuickTime)" },
+  { value: "avi", label: "AVI" },
+  { value: "webm", label: "WebM" },
+  { value: "mkv", label: "MKV" },
+  { value: "gif", label: "Animated GIF" }
+];
+
 const MIN_EDIT_GAP_SEC = 0.1;
 const SEGMENT_END_EPSILON = 0.03;
 
@@ -107,6 +121,17 @@ function formatFileSize(bytes: number): string {
   return `${sizeMb.toFixed(2)} MB`;
 }
 
+function parsePositiveIntegerInput(value: string): number | null {
+  if (!/^\d+$/.test(value)) {
+    return null;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return null;
+  }
+  return Math.round(parsed);
+}
+
 function exportStageLabel(stage: ExportStage): string {
   switch (stage) {
     case "loading-core":
@@ -116,7 +141,7 @@ function exportStageLabel(stage: ExportStage): string {
     case "processing-fast":
       return "Building edited timeline...";
     case "processing-reencode":
-      return "Retrying with re-encode...";
+      return "Re-encoding timeline segments...";
     case "finalizing":
       return "Finalizing export...";
   }
@@ -297,7 +322,13 @@ function App() {
 
   const [isExporting, setIsExporting] = useState(false);
   const [exportStage, setExportStage] = useState<ExportStage | null>(null);
+  const [exportStatusMessage, setExportStatusMessage] = useState<string | null>(null);
   const [exportProgress, setExportProgress] = useState(0);
+  const [exportMode, setExportMode] = useState<ExportMode>("fit");
+  const [exportFormat, setExportFormat] = useState<ExportFormat>("mp4");
+  const [exportWidthInput, setExportWidthInput] = useState("");
+  const [exportHeightInput, setExportHeightInput] = useState("");
+  const [exportFpsInput, setExportFpsInput] = useState("");
 
   const [isDraggingTrimWindow, setIsDraggingTrimWindow] = useState(false);
   const [isDraggingPlayhead, setIsDraggingPlayhead] = useState(false);
@@ -313,6 +344,19 @@ function App() {
 
   const clipById = useMemo(() => {
     return new Map(clips.map((clip) => [clip.id, clip]));
+  }, [clips]);
+
+  const largestClipResolution = useMemo(() => {
+    return clips.reduce(
+      (largest, clip) => {
+        const area = clip.width * clip.height;
+        if (area > largest.area) {
+          return { area, width: clip.width, height: clip.height };
+        }
+        return largest;
+      },
+      { area: 0, width: 0, height: 0 }
+    );
   }, [clips]);
 
   const timelineDisplayItems = useMemo(() => {
@@ -392,6 +436,10 @@ function App() {
     : null;
 
   const isBusy = isIngesting || isExporting;
+  const autoResolutionLabel =
+    largestClipResolution.area > 0
+      ? `${largestClipResolution.width} x ${largestClipResolution.height}`
+      : "none";
 
   useEffect(() => {
     clipsRef.current = clips;
@@ -723,6 +771,7 @@ function App() {
     setError(null);
     setExportProgress(0);
     setExportStage(null);
+    setExportStatusMessage(null);
     setDraggingTimelineItemId(null);
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
@@ -1056,8 +1105,42 @@ function App() {
       return;
     }
 
+    const widthValue = exportWidthInput.trim();
+    const heightValue = exportHeightInput.trim();
+    const fpsValue = exportFpsInput.trim();
+
+    let exportWidth: number | undefined;
+    let exportHeight: number | undefined;
+    let exportFps: number | undefined;
+
+    if ((widthValue === "") !== (heightValue === "")) {
+      setError("Set both output width and height, or leave both empty.");
+      return;
+    }
+
+    if (widthValue !== "" && heightValue !== "") {
+      const parsedWidth = parsePositiveIntegerInput(widthValue);
+      const parsedHeight = parsePositiveIntegerInput(heightValue);
+      if (!parsedWidth || !parsedHeight || parsedWidth < 2 || parsedHeight < 2) {
+        setError("Output resolution must use positive integers.");
+        return;
+      }
+      exportWidth = parsedWidth;
+      exportHeight = parsedHeight;
+    }
+
+    if (fpsValue !== "") {
+      const parsedFps = Number(fpsValue);
+      if (!Number.isFinite(parsedFps) || parsedFps < 1 || parsedFps > 120) {
+        setError("FPS must be between 1 and 120.");
+        return;
+      }
+      exportFps = Math.round(parsedFps);
+    }
+
     setIsExporting(true);
     setExportStage("loading-core");
+    setExportStatusMessage("Loading FFmpeg core...");
     setExportProgress(0);
     setError(null);
 
@@ -1071,19 +1154,29 @@ function App() {
         return {
           file: clip.file,
           startSec: segment.sourceStart,
-          endSec: segment.sourceEnd
+          endSec: segment.sourceEnd,
+          width: clip.width,
+          height: clip.height
         };
       });
 
       const blob = await exportEditedTimeline(exportSegments, {
-        onStageChange: (stage) => setExportStage(stage),
+        mode: exportMode,
+        format: exportFormat,
+        outputWidth: exportWidth,
+        outputHeight: exportHeight,
+        fps: exportFps,
+        onStageChange: (stage, message) => {
+          setExportStage(stage);
+          setExportStatusMessage(message);
+        },
         onProgress: (value) => setExportProgress(value)
       });
 
       const downloadUrl = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = downloadUrl;
-      anchor.download = "edited-video.mp4";
+      anchor.download = `edited-video.${exportFormat}`;
       document.body.appendChild(anchor);
       anchor.click();
       anchor.remove();
@@ -1094,6 +1187,7 @@ function App() {
 
       setExportProgress(1);
       setExportStage("finalizing");
+      setExportStatusMessage("Finalizing export...");
     } catch (caughtError) {
       const message =
         caughtError instanceof Error
@@ -1385,7 +1479,126 @@ function App() {
               )}
             </div>
 
+            <div className="export-settings">
+              <p className="export-settings-title">Export Settings</p>
+              <div className="export-settings-grid">
+                <label>
+                  Format
+                  <select
+                    className="time-input"
+                    value={exportFormat}
+                    onChange={(event) => setExportFormat(event.target.value as ExportFormat)}
+                    disabled={isBusy}
+                  >
+                    {EXPORT_FORMAT_OPTIONS.map((option) => (
+                      <option
+                        key={option.value}
+                        value={option.value}
+                      >
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label>
+                  FPS
+                  <input
+                    className="time-input"
+                    type="number"
+                    min={1}
+                    max={120}
+                    step={1}
+                    placeholder="Auto"
+                    value={exportFpsInput}
+                    onChange={(event) => setExportFpsInput(event.target.value)}
+                    disabled={isBusy}
+                  />
+                </label>
+
+                <label>
+                  Width
+                  <input
+                    className="time-input"
+                    type="number"
+                    min={2}
+                    step={1}
+                    placeholder="Auto"
+                    value={exportWidthInput}
+                    onChange={(event) => setExportWidthInput(event.target.value)}
+                    disabled={isBusy}
+                  />
+                </label>
+
+                <label>
+                  Height
+                  <input
+                    className="time-input"
+                    type="number"
+                    min={2}
+                    step={1}
+                    placeholder="Auto"
+                    value={exportHeightInput}
+                    onChange={(event) => setExportHeightInput(event.target.value)}
+                    disabled={isBusy}
+                  />
+                </label>
+              </div>
+
+              <div className="export-settings-actions">
+                <button
+                  className="button ghost tiny"
+                  type="button"
+                  onClick={() => {
+                    if (largestClipResolution.area <= 0) {
+                      return;
+                    }
+                    setExportWidthInput(String(largestClipResolution.width));
+                    setExportHeightInput(String(largestClipResolution.height));
+                  }}
+                  disabled={isBusy || largestClipResolution.area <= 0}
+                >
+                  Use Largest Source
+                </button>
+                <button
+                  className="button ghost tiny"
+                  type="button"
+                  onClick={() => {
+                    setExportWidthInput("");
+                    setExportHeightInput("");
+                  }}
+                  disabled={isBusy}
+                >
+                  Auto Resolution
+                </button>
+              </div>
+
+              <p className="hint">
+                Resolution auto uses the largest source clip ({autoResolutionLabel}). FPS auto keeps source timing.
+              </p>
+              {exportFormat === "gif" && <p className="hint">Animated GIF exports do not include audio.</p>}
+            </div>
+
             <div className="export-row">
+              <div className="export-mode">
+                <button
+                  className={`button ghost tiny${exportMode === "fit" ? " active" : ""}`}
+                  type="button"
+                  onClick={() => setExportMode("fit")}
+                  disabled={isBusy}
+                >
+                  Fit Canvas
+                </button>
+                <button
+                  className={`button ghost tiny${exportMode === "fast" ? " active" : ""}`}
+                  type="button"
+                  onClick={() => setExportMode("fast")}
+                  disabled={isBusy}
+                >
+                  Fast Copy
+                </button>
+              </div>
+
               <button
                 className="button primary"
                 type="button"
@@ -1396,10 +1609,16 @@ function App() {
               </button>
             </div>
 
+            <p className="hint">
+              {exportMode === "fit"
+                ? "Fit Canvas keeps one output resolution and avoids stretching, but is slower."
+                : "Fast Copy is quickest and may stretch/mismatch when source resolutions differ."}
+            </p>
+
             {(isExporting || exportStage) && (
               <div className="progress-block">
                 <p className="progress-label">
-                  {exportStage ? exportStageLabel(exportStage) : "Working..."}
+                  {exportStatusMessage ?? (exportStage ? exportStageLabel(exportStage) : "Working...")}
                 </p>
                 <div className="progress-bar">
                   <span
