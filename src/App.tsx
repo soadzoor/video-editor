@@ -14,6 +14,11 @@ import {
   type ExportMode,
   type ExportStage
 } from "./ffmpeg/export";
+import {
+  TimelinePreviewEngine,
+  type PreviewClip,
+  type PreviewSegment
+} from "./preview-engine";
 
 interface SourceClip {
   id: string;
@@ -52,11 +57,6 @@ interface EditedSegment {
   editedEnd: number;
 }
 
-interface PendingSeek {
-  sourceTime: number;
-  autoPlay: boolean;
-}
-
 interface TrimWindowDragState {
   pointerId: number;
   startClientX: number;
@@ -88,8 +88,6 @@ const MIN_SEGMENT_SPEED = 0.001;
 const MAX_SEGMENT_SPEED = 1000;
 const MIN_SEGMENT_SPEED_LOG = Math.log10(MIN_SEGMENT_SPEED);
 const MAX_SEGMENT_SPEED_LOG = Math.log10(MAX_SEGMENT_SPEED);
-const MIN_PREVIEW_PLAYBACK_RATE = 0.0625;
-const MAX_PREVIEW_PLAYBACK_RATE = 16;
 
 function makeId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -131,10 +129,6 @@ function formatFileSize(bytes: number): string {
 
 function clampSpeed(value: number): number {
   return clamp(value, MIN_SEGMENT_SPEED, MAX_SEGMENT_SPEED);
-}
-
-function clampPreviewPlaybackRate(value: number): number {
-  return clamp(value, MIN_PREVIEW_PLAYBACK_RATE, MAX_PREVIEW_PLAYBACK_RATE);
 }
 
 function speedToLogSliderValue(speed: number): number {
@@ -350,7 +344,7 @@ function App() {
   const [trimStartSec, setTrimStartSec] = useState(0);
   const [trimEndSec, setTrimEndSec] = useState(0);
   const [editedPositionSec, setEditedPositionSec] = useState(0);
-  const [currentSegmentIndex, setCurrentSegmentIndex] = useState(0);
+  const [, setCurrentSegmentIndex] = useState(0);
 
   const [timelineTool, setTimelineTool] = useState<TimelineTool>("select");
   const [selectedTimelineItemId, setSelectedTimelineItemId] = useState<string | null>(null);
@@ -369,10 +363,14 @@ function App() {
   const [isDraggingTrimWindow, setIsDraggingTrimWindow] = useState(false);
   const [isDraggingPlayhead, setIsDraggingPlayhead] = useState(false);
   const [selectedSpeedInput, setSelectedSpeedInput] = useState("");
+  const [isPreviewSupported] = useState(
+    () => typeof window !== "undefined" && "VideoDecoder" in window && "EncodedVideoChunk" in window
+  );
 
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const pendingSeekRef = useRef<PendingSeek | null>(null);
+  const previewCanvasRef = useRef<HTMLCanvasElement>(null);
+  const previewEngineRef = useRef<TimelinePreviewEngine | null>(null);
+  const editedSegmentsRef = useRef<EditedSegment[]>([]);
   const clipsRef = useRef<SourceClip[]>([]);
 
   const trimRangeShellRef = useRef<HTMLDivElement>(null);
@@ -412,9 +410,6 @@ function App() {
 
   const editedDurationSec =
     editedSegments.length > 0 ? editedSegments[editedSegments.length - 1].editedEnd : 0;
-
-  const activeSegment = editedSegments[currentSegmentIndex] ?? null;
-  const activeClip = activeSegment ? clipById.get(activeSegment.clipId) ?? null : null;
 
   const minTrimGapSec = Math.min(MIN_EDIT_GAP_SEC, timelineDurationSec);
 
@@ -480,19 +475,29 @@ function App() {
     largestClipResolution.area > 0
       ? `${largestClipResolution.width} x ${largestClipResolution.height}`
       : "none";
-
-  function applySegmentPlaybackRate(segment: EditedSegment | null): void {
-    const player = videoRef.current;
-    if (!player || !segment) {
-      return;
-    }
-    const targetRate = clampPreviewPlaybackRate(segment.speed);
-    try {
-      player.playbackRate = targetRate;
-    } catch {
-      player.playbackRate = 1;
-    }
-  }
+  const previewClips = useMemo<PreviewClip[]>(
+    () =>
+      clips.map((clip) => ({
+        id: clip.id,
+        file: clip.file,
+        width: clip.width,
+        height: clip.height
+      })),
+    [clips]
+  );
+  const previewSegments = useMemo<PreviewSegment[]>(
+    () =>
+      editedSegments.map((segment) => ({
+        id: segment.id,
+        clipId: segment.clipId,
+        sourceStart: segment.sourceStart,
+        sourceEnd: segment.sourceEnd,
+        speed: segment.speed,
+        editedStart: segment.editedStart,
+        editedEnd: segment.editedEnd
+      })),
+    [editedSegments]
+  );
 
   useEffect(() => {
     clipsRef.current = clips;
@@ -505,6 +510,67 @@ function App() {
       }
     };
   }, []);
+
+  useEffect(() => {
+    editedSegmentsRef.current = editedSegments;
+  }, [editedSegments]);
+
+  useEffect(() => {
+    if (!isPreviewSupported) {
+      return;
+    }
+
+    const canvas = previewCanvasRef.current;
+    if (!canvas) {
+      return;
+    }
+
+    const engine = new TimelinePreviewEngine(canvas, {
+      onTimeUpdate: (timeSec) => {
+        setEditedPositionSec((previous) => (nearlyEqual(previous, timeSec) ? previous : timeSec));
+
+        const currentSegments = editedSegmentsRef.current;
+        if (currentSegments.length === 0) {
+          setCurrentSegmentIndex(0);
+          return;
+        }
+
+        const upperBound = Math.max(0, currentSegments[currentSegments.length - 1].editedEnd - 0.0001);
+        const bounded = clamp(timeSec, 0, upperBound);
+        const nextIndex = Math.max(0, findSegmentIndex(currentSegments, bounded));
+        setCurrentSegmentIndex((previous) => (previous === nextIndex ? previous : nextIndex));
+      },
+      onPlayStateChange: (playing) => {
+        setIsPlaying(playing);
+      },
+      onError: (message) => {
+        setError(message);
+      }
+    });
+
+    previewEngineRef.current = engine;
+
+    return () => {
+      engine.destroy();
+      if (previewEngineRef.current === engine) {
+        previewEngineRef.current = null;
+      }
+    };
+  }, [isPreviewSupported]);
+
+  useEffect(() => {
+    if (!isPreviewSupported) {
+      return;
+    }
+
+    const engine = previewEngineRef.current;
+    if (!engine) {
+      return;
+    }
+
+    const currentPosition = engine.getPositionSec();
+    void engine.setProject(previewClips, previewSegments, currentPosition);
+  }, [isPreviewSupported, previewClips, previewSegments]);
 
   useEffect(() => {
     if (selectedTimelineItemId && !timelineItems.some((item) => item.id === selectedTimelineItemId)) {
@@ -529,47 +595,23 @@ function App() {
   // Reposition playback when timeline structure changes.
   useEffect(() => {
     if (editedSegments.length === 0) {
-      videoRef.current?.pause();
+      previewEngineRef.current?.pause();
       setCurrentSegmentIndex(0);
       setEditedPositionSec(0);
       setIsPlaying(false);
-      pendingSeekRef.current = null;
       return;
     }
 
+    const engine = previewEngineRef.current;
     const upperBound = Math.max(0, editedDurationSec - 0.0001);
-    const clampedPosition = clamp(editedPositionSec, 0, upperBound);
+    const currentPosition = engine?.getPositionSec() ?? editedPositionSec;
+    const clampedPosition = clamp(currentPosition, 0, upperBound);
     const nextSegmentIndex = Math.max(0, findSegmentIndex(editedSegments, clampedPosition));
-    const nextSegment = editedSegments[nextSegmentIndex];
-    const sourceTime =
-      nextSegment.sourceStart + (clampedPosition - nextSegment.editedStart) * nextSegment.speed;
-
-    if (isPlaying) {
-      videoRef.current?.pause();
-      setIsPlaying(false);
-    }
-    if (!nearlyEqual(editedPositionSec, clampedPosition)) {
-      setEditedPositionSec(clampedPosition);
-    }
-    if (currentSegmentIndex !== nextSegmentIndex) {
-      setCurrentSegmentIndex(nextSegmentIndex);
-    }
-
-    const player = videoRef.current;
-    const currentSegment = editedSegments[currentSegmentIndex] ?? null;
-    const sameClip = currentSegment && currentSegment.clipId === nextSegment.clipId;
-    if (player && sameClip) {
-      applySegmentPlaybackRate(nextSegment);
-      player.currentTime = clamp(
-        sourceTime,
-        nextSegment.sourceStart,
-        Math.max(nextSegment.sourceStart, nextSegment.sourceEnd - 0.0001)
-      );
-      pendingSeekRef.current = null;
-      return;
-    }
-
-    pendingSeekRef.current = { sourceTime, autoPlay: false };
+    engine?.pause();
+    setIsPlaying(false);
+    setEditedPositionSec((previous) => (nearlyEqual(previous, clampedPosition) ? previous : clampedPosition));
+    setCurrentSegmentIndex((previous) => (previous === nextSegmentIndex ? previous : nextSegmentIndex));
+    engine?.seek(clampedPosition);
   }, [editedDurationSec, editedSegments]);
 
   useEffect(() => {
@@ -720,14 +762,14 @@ function App() {
   }, [isBusy, isDraggingPlayhead, timelineDurationSec]);
 
   function resetTimelineWindow(durationSec: number): void {
-    videoRef.current?.pause();
+    previewEngineRef.current?.pause();
+    previewEngineRef.current?.seek(0);
     setTrimStartSec(0);
     setTrimEndSec(durationSec);
     setEditedPositionSec(0);
     setCurrentSegmentIndex(0);
     setIsPlaying(false);
     setSelectedTimelineItemId(null);
-    pendingSeekRef.current = null;
   }
 
   async function addVideos(fileList: FileList | null): Promise<void> {
@@ -867,32 +909,26 @@ function App() {
       return;
     }
 
-    const nextSegment = editedSegments[nextIndex];
-    const sourceTime =
-      nextSegment.sourceStart + (clamped - nextSegment.editedStart) * nextSegment.speed;
-
     setEditedPositionSec(clamped);
+    setCurrentSegmentIndex(nextIndex);
 
-    const currentSegment = editedSegments[currentSegmentIndex];
-    const sameClip = currentSegment && currentSegment.clipId === nextSegment.clipId;
-    const player = videoRef.current;
-
-    if (sameClip && player) {
-      setCurrentSegmentIndex(nextIndex);
-      applySegmentPlaybackRate(nextSegment);
-      player.currentTime = clamp(
-        sourceTime,
-        nextSegment.sourceStart,
-        Math.max(nextSegment.sourceStart, nextSegment.sourceEnd - 0.0001)
-      );
-      if (autoPlay) {
-        void player.play().catch(() => setIsPlaying(false));
-      }
+    const engine = previewEngineRef.current;
+    if (!engine) {
       return;
     }
 
-    pendingSeekRef.current = { sourceTime, autoPlay };
-    setCurrentSegmentIndex(nextIndex);
+    engine.seek(clamped);
+    if (autoPlay) {
+      void engine.play().catch(() => {
+        setError("Unable to start playback. Interact with the page and try again.");
+      });
+      return;
+    }
+
+    if (isPlaying) {
+      engine.pause();
+      setIsPlaying(false);
+    }
   }
 
   function seekToTimelinePosition(rawPositionSec: number, autoPlay: boolean): void {
@@ -905,83 +941,11 @@ function App() {
     seekToEditedPosition(targetEdited, autoPlay);
   }
 
-  function handlePlayerLoadedMetadata(): void {
-    const player = videoRef.current;
-    const segment = editedSegments[currentSegmentIndex];
-    if (!player || !segment) {
-      return;
-    }
-
-    const pendingSeek = pendingSeekRef.current;
-    const fallbackSourceTime =
-      segment.sourceStart +
-      clamp(editedPositionSec - segment.editedStart, 0, segment.editedEnd - segment.editedStart) *
-        segment.speed;
-    const targetSourceTime = pendingSeek ? pendingSeek.sourceTime : fallbackSourceTime;
-
-    applySegmentPlaybackRate(segment);
-    player.currentTime = clamp(
-      targetSourceTime,
-      segment.sourceStart,
-      Math.max(segment.sourceStart, segment.sourceEnd - 0.0001)
-    );
-
-    if (pendingSeek?.autoPlay) {
-      void player.play().catch(() => setIsPlaying(false));
-    }
-
-    pendingSeekRef.current = null;
-  }
-
-  function handlePlayerTimeUpdate(): void {
-    const player = videoRef.current;
-    const segment = editedSegments[currentSegmentIndex];
-    if (!player || !segment) {
-      return;
-    }
-
-    const timelineTime =
-      segment.editedStart + (player.currentTime - segment.sourceStart) / segment.speed;
-    setEditedPositionSec(clamp(timelineTime, segment.editedStart, segment.editedEnd));
-
-    if (player.currentTime < segment.sourceEnd - SEGMENT_END_EPSILON) {
-      return;
-    }
-
-    if (currentSegmentIndex >= editedSegments.length - 1) {
-      setEditedPositionSec(editedDurationSec);
-      setIsPlaying(false);
-      return;
-    }
-
-    const nextIndex = currentSegmentIndex + 1;
-    const nextSegment = editedSegments[nextIndex];
-
-    if (nextSegment.clipId === segment.clipId) {
-      setCurrentSegmentIndex(nextIndex);
-      applySegmentPlaybackRate(nextSegment);
-      player.currentTime = nextSegment.sourceStart;
-      if (isPlaying) {
-        void player.play().catch(() => setIsPlaying(false));
-      }
-      return;
-    }
-
-    pendingSeekRef.current = {
-      sourceTime: nextSegment.sourceStart,
-      autoPlay: isPlaying
-    };
-    setCurrentSegmentIndex(nextIndex);
-  }
-
   async function togglePlayPause(): Promise<void> {
-    const player = videoRef.current;
-    const segment = editedSegments[currentSegmentIndex] ?? null;
-    if (!player || editedSegments.length === 0 || !segment) {
+    const engine = previewEngineRef.current;
+    if (!engine || editedSegments.length === 0) {
       return;
     }
-
-    applySegmentPlaybackRate(segment);
 
     if (!isPlaying) {
       if (editedPositionSec >= editedDurationSec - SEGMENT_END_EPSILON) {
@@ -989,14 +953,15 @@ function App() {
       }
 
       try {
-        await player.play();
+        await engine.play();
       } catch {
         setError("Unable to start playback. Interact with the page and try again.");
       }
       return;
     }
 
-    player.pause();
+    engine.pause();
+    setIsPlaying(false);
   }
 
   function splitTimelineAt(rawPositionSec: number): void {
@@ -1119,7 +1084,7 @@ function App() {
     event.preventDefault();
     event.stopPropagation();
 
-    videoRef.current?.pause();
+    previewEngineRef.current?.pause();
     setIsPlaying(false);
 
     playheadDragRef.current = {
@@ -1418,17 +1383,17 @@ function App() {
 
       <section className="preview-panel">
         <div className="preview-frame">
-          {activeClip ? (
-            <video
-              ref={videoRef}
-              src={activeClip.url}
-              onLoadedMetadata={handlePlayerLoadedMetadata}
-              onTimeUpdate={handlePlayerTimeUpdate}
-              onPlay={() => setIsPlaying(true)}
-              onPause={() => setIsPlaying(false)}
-              playsInline
+          {isPreviewSupported ? (
+            <canvas
+              ref={previewCanvasRef}
+              className="preview-canvas"
             />
           ) : (
+            <div className="preview-empty">
+              <p>This browser does not support WebCodecs preview.</p>
+            </div>
+          )}
+          {isPreviewSupported && clips.length === 0 && (
             <div className="preview-empty">
               <p>Add videos to start editing.</p>
             </div>
@@ -1652,10 +1617,7 @@ function App() {
                     <span>{formatSpeedLabel(MAX_SEGMENT_SPEED)}x</span>
                   </div>
                   <p className="hint">Log slider: 1x is centered.</p>
-                  <p className="hint">
-                    Preview rate is clamped by the browser ({MIN_PREVIEW_PLAYBACK_RATE}x to {MAX_PREVIEW_PLAYBACK_RATE}x),
-                    but export still uses the exact value.
-                  </p>
+                  <p className="hint">Preview uses a custom WebCodecs + Canvas engine.</p>
                   <div className="piece-speed-presets">
                     {[0.01, 0.1, 0.5, 1, 2, 10, 100].map((preset) => (
                       <button
