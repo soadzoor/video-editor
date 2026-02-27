@@ -88,6 +88,10 @@ const MIN_SEGMENT_SPEED = 0.001;
 const MAX_SEGMENT_SPEED = 1000;
 const MIN_SEGMENT_SPEED_LOG = Math.log10(MIN_SEGMENT_SPEED);
 const MAX_SEGMENT_SPEED_LOG = Math.log10(MAX_SEGMENT_SPEED);
+const TRIM_SLIDER_STEP_SEC = 0.001;
+const TRIM_ARROW_STEP_DEFAULT_SEC = 0.001;
+const TRIM_ARROW_STEP_ALT_SEC = 0.01;
+const TRIM_ARROW_STEP_SHIFT_SEC = 0.1;
 
 function makeId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -152,6 +156,13 @@ function parsePositiveIntegerInput(value: string): number | null {
     return null;
   }
   return Math.round(parsed);
+}
+
+function normalizeTimeValue(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  return Math.round(value * 1_000_000) / 1_000_000;
 }
 
 function exportStageLabel(stage: ExportStage): string {
@@ -376,6 +387,8 @@ function App() {
   const trimRangeShellRef = useRef<HTMLDivElement>(null);
   const trimWindowDragRef = useRef<TrimWindowDragState | null>(null);
   const playheadDragRef = useRef<PlayheadDragState | null>(null);
+  const previousTimelineDurationRef = useRef(0);
+  const skipTrimRescaleRef = useRef(false);
 
   const clipById = useMemo(() => {
     return new Map(clips.map((clip) => [clip.id, clip]));
@@ -614,6 +627,45 @@ function App() {
     engine?.seek(clampedPosition);
   }, [editedDurationSec, editedSegments]);
 
+  // Keep trim window visual coverage stable when timeline duration changes (e.g. speed edits).
+  useEffect(() => {
+    const previousDuration = previousTimelineDurationRef.current;
+    previousTimelineDurationRef.current = timelineDurationSec;
+
+    if (skipTrimRescaleRef.current) {
+      skipTrimRescaleRef.current = false;
+      return;
+    }
+
+    if (
+      previousDuration <= 0 ||
+      timelineDurationSec <= 0 ||
+      nearlyEqual(previousDuration, timelineDurationSec)
+    ) {
+      return;
+    }
+
+    const startRatio = clamp(trimStartSec / previousDuration, 0, 1);
+    const endRatio = clamp(trimEndSec / previousDuration, startRatio, 1);
+
+    let nextStart = startRatio * timelineDurationSec;
+    let nextEnd = endRatio * timelineDurationSec;
+
+    const gap = Math.min(MIN_EDIT_GAP_SEC, timelineDurationSec);
+    if (nextEnd - nextStart < gap) {
+      const center = (nextStart + nextEnd) / 2;
+      nextStart = clamp(center - gap / 2, 0, Math.max(0, timelineDurationSec - gap));
+      nextEnd = nextStart + gap;
+    }
+
+    if (!nearlyEqual(nextStart, trimStartSec)) {
+      setTrimStartSec(nextStart);
+    }
+    if (!nearlyEqual(nextEnd, trimEndSec)) {
+      setTrimEndSec(nextEnd);
+    }
+  }, [timelineDurationSec, trimEndSec, trimStartSec]);
+
   useEffect(() => {
     if (timelineDurationSec <= 0) {
       if (!nearlyEqual(trimStartSec, 0)) {
@@ -762,6 +814,7 @@ function App() {
   }, [isBusy, isDraggingPlayhead, timelineDurationSec]);
 
   function resetTimelineWindow(durationSec: number): void {
+    skipTrimRescaleRef.current = true;
     previewEngineRef.current?.pause();
     previewEngineRef.current?.seek(0);
     setTrimStartSec(0);
@@ -939,6 +992,78 @@ function App() {
     const boundedRaw = clamp(rawPositionSec, trimStartSec, trimEndSec);
     const targetEdited = clamp(boundedRaw - trimStartSec, 0, editedDurationSec);
     seekToEditedPosition(targetEdited, autoPlay);
+  }
+
+  function applyTrimStart(nextValueSec: number): void {
+    const maxStart = Math.max(0, trimEndSec - minTrimGapSec);
+    const snapThreshold = TRIM_SLIDER_STEP_SEC * 1.5;
+    let bounded = clamp(nextValueSec, 0, maxStart);
+    if (bounded <= snapThreshold) {
+      bounded = 0;
+    } else if (maxStart - bounded <= snapThreshold) {
+      bounded = maxStart;
+    }
+    bounded = normalizeTimeValue(bounded);
+    setTrimStartSec((previous) => (nearlyEqual(previous, bounded) ? previous : bounded));
+  }
+
+  function applyTrimEnd(nextValueSec: number): void {
+    const minEnd = Math.min(timelineDurationSec, trimStartSec + minTrimGapSec);
+    const snapThreshold = TRIM_SLIDER_STEP_SEC * 1.5;
+    let bounded = clamp(nextValueSec, minEnd, timelineDurationSec);
+    if (timelineDurationSec - bounded <= snapThreshold) {
+      bounded = timelineDurationSec;
+    } else if (bounded - minEnd <= snapThreshold) {
+      bounded = minEnd;
+    }
+    bounded = normalizeTimeValue(bounded);
+    setTrimEndSec((previous) => (nearlyEqual(previous, bounded) ? previous : bounded));
+  }
+
+  function trimArrowStep(event: React.KeyboardEvent<HTMLInputElement>): number {
+    if (event.shiftKey) {
+      return TRIM_ARROW_STEP_SHIFT_SEC;
+    }
+    if (event.altKey) {
+      return TRIM_ARROW_STEP_ALT_SEC;
+    }
+    return TRIM_ARROW_STEP_DEFAULT_SEC;
+  }
+
+  function handleTrimStartKeyDown(event: React.KeyboardEvent<HTMLInputElement>): void {
+    if (isBusy) {
+      return;
+    }
+    if (
+      event.key !== "ArrowLeft" &&
+      event.key !== "ArrowRight" &&
+      event.key !== "ArrowUp" &&
+      event.key !== "ArrowDown"
+    ) {
+      return;
+    }
+
+    event.preventDefault();
+    const direction = event.key === "ArrowRight" || event.key === "ArrowUp" ? 1 : -1;
+    applyTrimStart(trimStartSec + direction * trimArrowStep(event));
+  }
+
+  function handleTrimEndKeyDown(event: React.KeyboardEvent<HTMLInputElement>): void {
+    if (isBusy) {
+      return;
+    }
+    if (
+      event.key !== "ArrowLeft" &&
+      event.key !== "ArrowRight" &&
+      event.key !== "ArrowUp" &&
+      event.key !== "ArrowDown"
+    ) {
+      return;
+    }
+
+    event.preventDefault();
+    const direction = event.key === "ArrowRight" || event.key === "ArrowUp" ? 1 : -1;
+    applyTrimEnd(trimEndSec + direction * trimArrowStep(event));
   }
 
   async function togglePlayPause(): Promise<void> {
@@ -1524,14 +1649,12 @@ function App() {
                   type="range"
                   min={0}
                   max={timelineDurationSec}
-                  step={0.05}
+                  step={TRIM_SLIDER_STEP_SEC}
                   value={clamp(trimStartSec, 0, timelineDurationSec)}
                   onChange={(event) => {
-                    const value = Number(event.target.value);
-                    setTrimStartSec(
-                      clamp(value, 0, Math.max(0, trimEndSec - minTrimGapSec))
-                    );
+                    applyTrimStart(Number(event.target.value));
                   }}
+                  onKeyDown={handleTrimStartKeyDown}
                   disabled={isBusy}
                   aria-label="Trim start"
                 />
@@ -1541,18 +1664,12 @@ function App() {
                   type="range"
                   min={0}
                   max={timelineDurationSec}
-                  step={0.05}
+                  step={TRIM_SLIDER_STEP_SEC}
                   value={clamp(trimEndSec, 0, timelineDurationSec)}
                   onChange={(event) => {
-                    const value = Number(event.target.value);
-                    setTrimEndSec(
-                      clamp(
-                        value,
-                        Math.min(timelineDurationSec, trimStartSec + minTrimGapSec),
-                        timelineDurationSec
-                      )
-                    );
+                    applyTrimEnd(Number(event.target.value));
                   }}
+                  onKeyDown={handleTrimEndKeyDown}
                   disabled={isBusy}
                   aria-label="Trim end"
                 />
