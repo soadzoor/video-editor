@@ -382,7 +382,7 @@ function App() {
   } | null>(null);
   const [exportStartedAtMs, setExportStartedAtMs] = useState<number | null>(null);
   const [exportNowMs, setExportNowMs] = useState(() => Date.now());
-  const [exportMode, setExportMode] = useState<ExportMode>("fit");
+  const [exportMode, setExportMode] = useState<ExportMode>("fast");
   const [exportFormat, setExportFormat] = useState<ExportFormat>("mp4");
   const [exportWidthInput, setExportWidthInput] = useState("");
   const [exportHeightInput, setExportHeightInput] = useState("");
@@ -441,6 +441,26 @@ function App() {
 
   const editedDurationSec =
     editedSegments.length > 0 ? editedSegments[editedSegments.length - 1].editedEnd : 0;
+  const hasEditedResolutionMismatch = useMemo(() => {
+    if (editedSegments.length <= 1) {
+      return false;
+    }
+
+    const resolutionKeys = new Set<string>();
+    for (const segment of editedSegments) {
+      const clip = clipById.get(segment.clipId);
+      if (!clip) {
+        continue;
+      }
+
+      resolutionKeys.add(`${clip.width}x${clip.height}`);
+      if (resolutionKeys.size > 1) {
+        return true;
+      }
+    }
+
+    return false;
+  }, [clipById, editedSegments]);
   const requestedExportFps = useMemo(() => {
     const value = exportFpsInput.trim();
     if (value === "") {
@@ -587,6 +607,14 @@ function App() {
   useEffect(() => {
     editedSegmentsRef.current = editedSegments;
   }, [editedSegments]);
+
+  useEffect(() => {
+    if (!hasEditedResolutionMismatch) {
+      return;
+    }
+
+    setExportMode((previous) => (previous === "fit" ? previous : "fit"));
+  }, [hasEditedResolutionMismatch]);
 
   useEffect(() => {
     if (!isExporting) {
