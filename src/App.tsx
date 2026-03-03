@@ -126,6 +126,18 @@ function formatSecondsLabel(seconds: number): string {
   return `${Math.max(0, seconds).toFixed(2)}s`;
 }
 
+function formatEta(seconds: number): string {
+  const total = Math.max(0, Math.ceil(seconds));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+
+  if (hours > 0) {
+    return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+  }
+  return `${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+}
+
 function formatFileSize(bytes: number): string {
   const sizeMb = bytes / (1024 * 1024);
   return `${sizeMb.toFixed(2)} MB`;
@@ -365,6 +377,13 @@ function App() {
   const [exportStage, setExportStage] = useState<ExportStage | null>(null);
   const [exportStatusMessage, setExportStatusMessage] = useState<string | null>(null);
   const [exportProgress, setExportProgress] = useState(0);
+  const [exportFrameProgress, setExportFrameProgress] = useState<{
+    currentFrame: number;
+    totalFrames: number;
+    percent: number;
+  } | null>(null);
+  const [exportStartedAtMs, setExportStartedAtMs] = useState<number | null>(null);
+  const [exportNowMs, setExportNowMs] = useState(() => Date.now());
   const [exportMode, setExportMode] = useState<ExportMode>("fit");
   const [exportFormat, setExportFormat] = useState<ExportFormat>("mp4");
   const [exportWidthInput, setExportWidthInput] = useState("");
@@ -423,6 +442,24 @@ function App() {
 
   const editedDurationSec =
     editedSegments.length > 0 ? editedSegments[editedSegments.length - 1].editedEnd : 0;
+  const requestedExportFps = useMemo(() => {
+    const value = exportFpsInput.trim();
+    if (value === "") {
+      return null;
+    }
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed < 1 || parsed > 120) {
+      return null;
+    }
+    return Math.round(parsed);
+  }, [exportFpsInput]);
+  const frameReadoutFps = requestedExportFps ?? 30;
+  const isFrameReadoutEstimated = requestedExportFps === null;
+  const totalEditedFrames = Math.max(0, Math.round(editedDurationSec * frameReadoutFps));
+  const currentEditedFrame =
+    totalEditedFrames > 0
+      ? clamp(Math.floor(editedPositionSec * frameReadoutFps), 0, totalEditedFrames)
+      : 0;
 
   const minTrimGapSec = Math.min(MIN_EDIT_GAP_SEC, timelineDurationSec);
 
@@ -484,6 +521,30 @@ function App() {
     : 0;
 
   const isBusy = isIngesting || isExporting;
+  const exportProgressValue = Math.min(
+    1,
+    Math.max(0, exportFrameProgress?.percent ?? exportProgress)
+  );
+  const exportProgressPercentText = `${(exportProgressValue * 100).toFixed(2)}%`;
+  const exportFrameCountText =
+    exportFrameProgress && exportFrameProgress.totalFrames > 0
+      ? `${exportFrameProgress.currentFrame.toLocaleString()} / ${exportFrameProgress.totalFrames.toLocaleString()} frames`
+      : null;
+  const exportElapsedSec =
+    exportStartedAtMs !== null ? Math.max(0, (exportNowMs - exportStartedAtMs) / 1000) : null;
+  const exportEtaSec =
+    isExporting &&
+    exportElapsedSec !== null &&
+    exportProgressValue >= 0.005 &&
+    exportProgressValue < 1
+      ? Math.max(0, exportElapsedSec / exportProgressValue - exportElapsedSec)
+      : null;
+  const exportEtaText =
+    isExporting && exportProgressValue < 1
+      ? exportEtaSec === null
+        ? "ETA --:--"
+        : `ETA ${formatEta(exportEtaSec)}`
+      : null;
   const autoResolutionLabel =
     largestClipResolution.area > 0
       ? `${largestClipResolution.width} x ${largestClipResolution.height}`
@@ -527,6 +588,20 @@ function App() {
   useEffect(() => {
     editedSegmentsRef.current = editedSegments;
   }, [editedSegments]);
+
+  useEffect(() => {
+    if (!isExporting) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      setExportNowMs(Date.now());
+    }, 1000);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [isExporting]);
 
   useEffect(() => {
     if (!isPreviewSupported) {
@@ -942,6 +1017,8 @@ function App() {
     resetTimelineWindow(0);
     setError(null);
     setExportProgress(0);
+    setExportFrameProgress(null);
+    setExportStartedAtMs(null);
     setExportStage(null);
     setExportStatusMessage(null);
     setDraggingTimelineItemId(null);
@@ -1362,6 +1439,9 @@ function App() {
     setExportStage("loading-core");
     setExportStatusMessage("Loading FFmpeg core...");
     setExportProgress(0);
+    setExportFrameProgress(null);
+    setExportStartedAtMs(Date.now());
+    setExportNowMs(Date.now());
     setError(null);
 
     try {
@@ -1391,7 +1471,10 @@ function App() {
           setExportStage(stage);
           setExportStatusMessage(message);
         },
-        onProgress: (value) => setExportProgress(value)
+        onProgress: (value) => setExportProgress(value),
+        onFrameProgress: (currentFrame, totalFrames, percent) => {
+          setExportFrameProgress({ currentFrame, totalFrames, percent });
+        }
       });
 
       const downloadUrl = URL.createObjectURL(blob);
@@ -1417,6 +1500,7 @@ function App() {
       setError(message);
     } finally {
       setIsExporting(false);
+      setExportStartedAtMs(null);
     }
   }
 
@@ -1545,6 +1629,10 @@ function App() {
 
               <p className="timeline-readout">
                 {formatDuration(editedPositionSec)} / {formatDuration(editedDurationSec)}
+              </p>
+              <p className="timeline-readout-sub">
+                Frame {currentEditedFrame.toLocaleString()} / {totalEditedFrames.toLocaleString()}
+                {isFrameReadoutEstimated ? " (auto fps)" : ""}
               </p>
 
               <div className="timeline-tools">
@@ -1918,6 +2006,11 @@ function App() {
                     }}
                   />
                 </div>
+                <p className="progress-meta">
+                  {exportProgressPercentText}
+                  {exportFrameCountText ? ` · ${exportFrameCountText}` : ""}
+                  {exportEtaText ? ` · ${exportEtaText}` : ""}
+                </p>
               </div>
             )}
           </>

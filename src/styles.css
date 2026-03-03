@@ -236,6 +236,12 @@ body {
   color: var(--text-muted);
 }
 
+.timeline-readout-sub {
+  margin: 2px 0 0;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
 .timeline-seek-block {
   display: grid;
   gap: 8px;
@@ -340,6 +346,12 @@ body {
 .progress-label {
   margin: 0;
   font-size: 0.9rem;
+}
+
+.progress-meta {
+  margin: 0;
+  font-size: 0.82rem;
+  color: var(--text-muted);
 }
 
 .progress-bar {

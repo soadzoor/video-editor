@@ -33,6 +33,7 @@ export interface ExportOptions {
   fps?: number;
   onStageChange?: (stage: ExportStage, message: string) => void;
   onProgress?: (value: number) => void;
+  onFrameProgress?: (currentFrame: number, totalFrames: number, percent: number) => void;
 }
 
 function sanitizeExtension(fileName: string): string {
@@ -93,6 +94,102 @@ function buildAtempoFilter(speed: number): string {
 
   filters.push(`atempo=${remaining.toFixed(5)}`);
   return filters.join(",");
+}
+
+function clampUnit(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  return Math.min(1, Math.max(0, value));
+}
+
+function toFrameCount(durationSec: number, fps: number): number {
+  if (!Number.isFinite(durationSec) || durationSec <= 0) {
+    return 0;
+  }
+  return Math.max(1, Math.round(durationSec * fps));
+}
+
+class FrameProgressTracker {
+  private plannedFrames = 0;
+  private completedFrames = 0;
+  private activeFrameBudget = 0;
+  private activeFrameProgress = 0;
+  private hasActiveCommand = false;
+
+  constructor(private readonly options: ExportOptions) {}
+
+  public addPlannedFrames(frames: number): void {
+    const safeFrames = Math.max(0, Math.round(frames));
+    if (safeFrames <= 0) {
+      return;
+    }
+    this.plannedFrames += safeFrames;
+    this.emit();
+  }
+
+  public beginCommand(frameBudget: number): void {
+    const safeBudget = Math.max(0, Math.round(frameBudget));
+    this.activeFrameBudget = safeBudget;
+    this.activeFrameProgress = 0;
+    this.hasActiveCommand = safeBudget > 0;
+    this.emit();
+  }
+
+  public updateCommandProgress(progress: number): void {
+    if (!this.hasActiveCommand || this.activeFrameBudget <= 0) {
+      return;
+    }
+    this.activeFrameProgress = clampUnit(progress);
+    this.emit();
+  }
+
+  public endCommand(success: boolean): void {
+    if (this.hasActiveCommand && this.activeFrameBudget > 0) {
+      const completedForCommand = success
+        ? this.activeFrameBudget
+        : Math.round(this.activeFrameBudget * this.activeFrameProgress);
+      this.completedFrames += Math.max(0, completedForCommand);
+    }
+
+    this.activeFrameBudget = 0;
+    this.activeFrameProgress = 0;
+    this.hasActiveCommand = false;
+    this.emit();
+  }
+
+  public markComplete(): void {
+    if (this.plannedFrames <= 0) {
+      this.options.onProgress?.(1);
+      this.options.onFrameProgress?.(0, 0, 1);
+      return;
+    }
+
+    this.completedFrames = this.plannedFrames;
+    this.activeFrameBudget = 0;
+    this.activeFrameProgress = 0;
+    this.hasActiveCommand = false;
+    this.emit();
+  }
+
+  private emit(): void {
+    if (this.plannedFrames <= 0) {
+      this.options.onProgress?.(0);
+      this.options.onFrameProgress?.(0, 0, 0);
+      return;
+    }
+
+    const totalFrames = Math.max(1, Math.round(this.plannedFrames));
+    const processedFramesRaw =
+      this.completedFrames + this.activeFrameBudget * this.activeFrameProgress;
+    const processedFrames = Math.round(
+      Math.min(totalFrames, Math.max(0, processedFramesRaw))
+    );
+    const percent = clampUnit(processedFrames / totalFrames);
+
+    this.options.onProgress?.(percent);
+    this.options.onFrameProgress?.(processedFrames, totalFrames, percent);
+  }
 }
 
 function getFormatConfig(format: ExportFormat): ExportFormatConfig {
@@ -230,11 +327,27 @@ export async function exportEditedTimeline(
   const reencodePreset = baseVideoFilter ? "ultrafast" : "veryfast";
   const reencodeCrf = baseVideoFilter ? "28" : "23";
   const reencodeAudioBitrate = baseVideoFilter ? "96k" : "128k";
+  const progressFps = targetFps ?? 30;
+  const segmentFrameBudgets = sanitizedSegments.map((segment) => {
+    const timelineDuration = (segment.endSec - segment.startSec) / Math.max(0.001, segment.speed);
+    return toFrameCount(timelineDuration, progressFps);
+  });
+  const timelineFrameBudget = segmentFrameBudgets.reduce((sum, frames) => sum + frames, 0);
+  const frameTracker = new FrameProgressTracker(options);
 
   options.onStageChange?.("loading-core", "Loading FFmpeg core...");
   options.onProgress?.(0);
+  options.onFrameProgress?.(0, timelineFrameBudget, 0);
   const ffmpeg = await getFFmpeg();
   attachFfmpegDebugListener(ffmpeg);
+  let activeCommandTracking = false;
+  const progressListener = ({ progress }: { progress: number }) => {
+    if (!activeCommandTracking) {
+      return;
+    }
+    frameTracker.updateCommandProgress(progress);
+  };
+  ffmpeg.on("progress", progressListener);
   console.log("[export] config", {
     segmentCount: sanitizedSegments.length,
     exportMode,
@@ -264,258 +377,113 @@ export async function exportEditedTimeline(
 
   const fileKeyToPath = new Map<string, string>();
 
+  async function runCommandWithFrameProgress(
+    args: string[],
+    label: string,
+    frameBudget: number
+  ): Promise<number> {
+    const safeBudget = Math.max(0, Math.round(frameBudget));
+    frameTracker.beginCommand(safeBudget);
+    activeCommandTracking = safeBudget > 0;
+    let success = false;
+    try {
+      const exitCode = await execWithDebug(ffmpeg, args, label);
+      success = exitCode === 0;
+      return exitCode;
+    } finally {
+      activeCommandTracking = false;
+      frameTracker.endCommand(success);
+    }
+  }
+
   try {
-    options.onStageChange?.("preparing-inputs", "Writing source files...");
-
-    for (const [index, segment] of sanitizedSegments.entries()) {
-      const key = `${segment.file.name}:${segment.file.size}:${segment.file.lastModified}`;
-      if (!fileKeyToPath.has(key)) {
-        const extension = sanitizeExtension(segment.file.name);
-        const sourcePath = `${runId}-src-${fileKeyToPath.size}.${extension}`;
-        await ffmpeg.writeFile(sourcePath, await fetchFile(segment.file));
-        fileKeyToPath.set(key, sourcePath);
-        sourcePaths.push(sourcePath);
+    try {
+      if (canUseFastPath) {
+        frameTracker.addPlannedFrames(timelineFrameBudget);
       }
 
-      const segmentPath = `${runId}-seg-${index}.mp4`;
-      segmentPaths.push(segmentPath);
-    }
+      options.onStageChange?.("preparing-inputs", "Writing source files...");
 
-    const segmentTotal = sanitizedSegments.length;
+      for (const [index, segment] of sanitizedSegments.entries()) {
+        const key = `${segment.file.name}:${segment.file.size}:${segment.file.lastModified}`;
+        if (!fileKeyToPath.has(key)) {
+          const extension = sanitizeExtension(segment.file.name);
+          const sourcePath = `${runId}-src-${fileKeyToPath.size}.${extension}`;
+          await ffmpeg.writeFile(sourcePath, await fetchFile(segment.file));
+          fileKeyToPath.set(key, sourcePath);
+          sourcePaths.push(sourcePath);
+        }
 
-    if (!canUseFastPath) {
-      throw new Error("fast-path-failed");
-    }
-
-    options.onStageChange?.("processing-fast", "Extracting timeline segments...");
-    for (const [index, segment] of sanitizedSegments.entries()) {
-      const key = `${segment.file.name}:${segment.file.size}:${segment.file.lastModified}`;
-      const sourcePath = fileKeyToPath.get(key);
-      if (!sourcePath) {
-        throw new Error("Source path not found during export.");
+        const segmentPath = `${runId}-seg-${index}.mp4`;
+        segmentPaths.push(segmentPath);
       }
 
-      const duration = segment.endSec - segment.startSec;
-      const segmentPath = segmentPaths[index];
-      const exitCode = await execWithDebug(
-        ffmpeg,
-        [
-        "-nostdin",
-        "-y",
-        "-ss",
-        toFfmpegSeconds(segment.startSec),
-        "-t",
-        toFfmpegSeconds(duration),
-        "-i",
-        sourcePath,
-        "-map",
-        "0:v:0?",
-        "-map",
-        "0:a:0?",
-        "-c",
-        "copy",
-        segmentPath
-        ],
-        `fast-segment-${index}`
-      );
-
-      if (exitCode !== 0) {
+      if (!canUseFastPath) {
         throw new Error("fast-path-failed");
       }
 
-      options.onProgress?.(0.1 + ((index + 1) / segmentTotal) * 0.6);
-    }
+      options.onStageChange?.("processing-fast", "Extracting timeline segments...");
+      for (const [index, segment] of sanitizedSegments.entries()) {
+        const key = `${segment.file.name}:${segment.file.size}:${segment.file.lastModified}`;
+        const sourcePath = fileKeyToPath.get(key);
+        if (!sourcePath) {
+          throw new Error("Source path not found during export.");
+        }
 
-    if (segmentPaths.length === 1) {
-      const cloneExitCode = await execWithDebug(
-        ffmpeg,
-        [
-          "-nostdin",
-          "-y",
-          "-i",
-          segmentPaths[0],
-          "-c",
-          "copy",
-          "-movflags",
-          "+faststart",
-          timelineOutputPath
-        ],
-        "fast-finalize-single"
-      );
-      if (cloneExitCode !== 0) {
-        throw new Error("fast-path-failed");
+        const duration = segment.endSec - segment.startSec;
+        const segmentPath = segmentPaths[index];
+        const exitCode = await runCommandWithFrameProgress(
+          [
+            "-nostdin",
+            "-y",
+            "-ss",
+            toFfmpegSeconds(segment.startSec),
+            "-t",
+            toFfmpegSeconds(duration),
+            "-i",
+            sourcePath,
+            "-map",
+            "0:v:0?",
+            "-map",
+            "0:a:0?",
+            "-c",
+            "copy",
+            segmentPath
+          ],
+          `fast-segment-${index}`,
+          segmentFrameBudgets[index] ?? 0
+        );
+
+        if (exitCode !== 0) {
+          throw new Error("fast-path-failed");
+        }
       }
-    } else {
-      await ffmpeg.writeFile(
-        inputListPath,
-        segmentPaths.map((path) => `file '${path}'`).join("\n")
-      );
-      const concatExitCode = await execWithDebug(
-        ffmpeg,
-        [
-          "-nostdin",
-          "-y",
-          "-f",
-          "concat",
-          "-safe",
-          "0",
-          "-i",
+
+      if (segmentPaths.length === 1) {
+        const cloneExitCode = await runCommandWithFrameProgress(
+          [
+            "-nostdin",
+            "-y",
+            "-i",
+            segmentPaths[0],
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            timelineOutputPath
+          ],
+          "fast-finalize-single",
+          0
+        );
+        if (cloneExitCode !== 0) {
+          throw new Error("fast-path-failed");
+        }
+      } else {
+        await ffmpeg.writeFile(
           inputListPath,
-          "-c",
-          "copy",
-          "-movflags",
-          "+faststart",
-          timelineOutputPath
-        ],
-        "fast-concat-copy"
-      );
-      if (concatExitCode !== 0) {
-        throw new Error("fast-path-failed");
-      }
-    }
-  } catch (error) {
-    const fastPathFailed = error instanceof Error && error.message === "fast-path-failed";
-    if (!fastPathFailed) {
-      throw error;
-    }
-
-    const fallbackNeedsStretch =
-      hasResolutionMismatch && exportMode === "fast" && !shouldNormalize && !shouldStretchResize;
-    const reencodeBaseFilters = [...baseFilters];
-    if (fallbackNeedsStretch) {
-      reencodeBaseFilters.unshift(stretchScaleFilter);
-    }
-
-    options.onStageChange?.(
-      "processing-reencode",
-      shouldNormalize
-        ? "Normalizing resolution (software encode, may take a while)..."
-        : fallbackNeedsStretch || shouldStretchResize
-          ? "Applying export resolution (software encode, may take a while)..."
-          : shouldApplyFps
-            ? "Applying export FPS (software encode, may take a while)..."
-            : hasSpeedChange
-              ? "Applying speed changes (software encode, may take a while)..."
-            : "Re-encoding timeline segments..."
-    );
-    options.onProgress?.(0.1);
-    await cleanupFiles(ffmpeg, [...segmentPaths, inputListPath, timelineOutputPath]);
-
-    const segmentTotal = sanitizedSegments.length;
-    for (const [index, segment] of sanitizedSegments.entries()) {
-      const key = `${segment.file.name}:${segment.file.size}:${segment.file.lastModified}`;
-      const sourcePath = fileKeyToPath.get(key);
-      if (!sourcePath) {
-        throw new Error("Source path not found during re-encode export.");
-      }
-
-      const duration = segment.endSec - segment.startSec;
-      const segmentPath = segmentPaths[index];
-      const segmentVideoFilters = [...reencodeBaseFilters];
-      if (!isSpeedNeutral(segment.speed)) {
-        segmentVideoFilters.push(`setpts=PTS/${segment.speed.toFixed(6)}`);
-      }
-      const segmentVideoFilter =
-        segmentVideoFilters.length > 0 ? segmentVideoFilters.join(",") : null;
-      const segmentAudioFilter = !isSpeedNeutral(segment.speed)
-        ? buildAtempoFilter(segment.speed)
-        : null;
-      const reencodeArgs: string[] = [
-        "-nostdin",
-        "-y",
-        "-ss",
-        toFfmpegSeconds(segment.startSec),
-        "-t",
-        toFfmpegSeconds(duration),
-        "-i",
-        sourcePath,
-        "-map",
-        "0:v:0?",
-        "-map",
-        "0:a:0?"
-      ];
-
-      if (segmentVideoFilter) {
-        reencodeArgs.push("-vf", segmentVideoFilter);
-      }
-
-      if (segmentAudioFilter) {
-        reencodeArgs.push("-af", segmentAudioFilter);
-      }
-
-      reencodeArgs.push(
-        "-c:v",
-        "libx264",
-        "-preset",
-        reencodePreset,
-        "-crf",
-        reencodeCrf,
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        reencodeAudioBitrate,
-        segmentPath
-      );
-
-      const exitCode = await execWithDebug(ffmpeg, reencodeArgs, `reencode-segment-${index}`);
-
-      if (exitCode !== 0) {
-        throw new Error("Export failed while re-encoding timeline segment.");
-      }
-
-      options.onProgress?.(0.1 + ((index + 1) / segmentTotal) * 0.6);
-    }
-
-    if (segmentPaths.length === 1) {
-      const cloneExitCode = await execWithDebug(
-        ffmpeg,
-        [
-          "-nostdin",
-          "-y",
-          "-i",
-          segmentPaths[0],
-          "-c",
-          "copy",
-          "-movflags",
-          "+faststart",
-          timelineOutputPath
-        ],
-        "reencode-finalize-single"
-      );
-      if (cloneExitCode !== 0) {
-        throw new Error("Export failed while finalizing single segment.");
-      }
-    } else {
-      await ffmpeg.writeFile(
-        inputListPath,
-        segmentPaths.map((path) => `file '${path}'`).join("\n")
-      );
-
-      let concatExitCode = await execWithDebug(
-        ffmpeg,
-        [
-          "-nostdin",
-          "-y",
-          "-f",
-          "concat",
-          "-safe",
-          "0",
-          "-i",
-          inputListPath,
-          "-c",
-          "copy",
-          "-movflags",
-          "+faststart",
-          timelineOutputPath
-        ],
-        "reencode-concat-copy"
-      );
-
-      if (concatExitCode !== 0) {
-        concatExitCode = await execWithDebug(
-          ffmpeg,
+          segmentPaths.map((path) => `file '${path}'`).join("\n")
+        );
+        const concatExitCode = await runCommandWithFrameProgress(
           [
             "-nostdin",
             "-y",
@@ -525,34 +493,205 @@ export async function exportEditedTimeline(
             "0",
             "-i",
             inputListPath,
-            "-c:v",
-            "libx264",
-            "-preset",
-            reencodePreset,
-            "-crf",
-            reencodeCrf,
-            "-c:a",
-            "aac",
-            "-b:a",
-            reencodeAudioBitrate,
+            "-c",
+            "copy",
             "-movflags",
             "+faststart",
             timelineOutputPath
           ],
-          "reencode-concat-transcode"
+          "fast-concat-copy",
+          0
         );
+        if (concatExitCode !== 0) {
+          throw new Error("fast-path-failed");
+        }
+      }
+    } catch (error) {
+      const fastPathFailed = error instanceof Error && error.message === "fast-path-failed";
+      if (!fastPathFailed) {
+        throw error;
       }
 
-      if (concatExitCode !== 0) {
-        throw new Error("Export failed while concatenating segments.");
+      frameTracker.addPlannedFrames(timelineFrameBudget);
+
+      const fallbackNeedsStretch =
+        hasResolutionMismatch && exportMode === "fast" && !shouldNormalize && !shouldStretchResize;
+      const reencodeBaseFilters = [...baseFilters];
+      if (fallbackNeedsStretch) {
+        reencodeBaseFilters.unshift(stretchScaleFilter);
+      }
+
+      options.onStageChange?.(
+        "processing-reencode",
+        shouldNormalize
+          ? "Normalizing resolution (software encode, may take a while)..."
+          : fallbackNeedsStretch || shouldStretchResize
+            ? "Applying export resolution (software encode, may take a while)..."
+            : shouldApplyFps
+              ? "Applying export FPS (software encode, may take a while)..."
+              : hasSpeedChange
+                ? "Applying speed changes (software encode, may take a while)..."
+                : "Re-encoding timeline segments..."
+      );
+      await cleanupFiles(ffmpeg, [...segmentPaths, inputListPath, timelineOutputPath]);
+
+      for (const [index, segment] of sanitizedSegments.entries()) {
+        const key = `${segment.file.name}:${segment.file.size}:${segment.file.lastModified}`;
+        const sourcePath = fileKeyToPath.get(key);
+        if (!sourcePath) {
+          throw new Error("Source path not found during re-encode export.");
+        }
+
+        const duration = segment.endSec - segment.startSec;
+        const segmentPath = segmentPaths[index];
+        const segmentVideoFilters = [...reencodeBaseFilters];
+        if (!isSpeedNeutral(segment.speed)) {
+          segmentVideoFilters.push(`setpts=PTS/${segment.speed.toFixed(6)}`);
+        }
+        const segmentVideoFilter =
+          segmentVideoFilters.length > 0 ? segmentVideoFilters.join(",") : null;
+        const segmentAudioFilter = !isSpeedNeutral(segment.speed)
+          ? buildAtempoFilter(segment.speed)
+          : null;
+        const reencodeArgs: string[] = [
+          "-nostdin",
+          "-y",
+          "-ss",
+          toFfmpegSeconds(segment.startSec),
+          "-t",
+          toFfmpegSeconds(duration),
+          "-i",
+          sourcePath,
+          "-map",
+          "0:v:0?",
+          "-map",
+          "0:a:0?"
+        ];
+
+        if (segmentVideoFilter) {
+          reencodeArgs.push("-vf", segmentVideoFilter);
+        }
+
+        if (segmentAudioFilter) {
+          reencodeArgs.push("-af", segmentAudioFilter);
+        }
+
+        reencodeArgs.push(
+          "-c:v",
+          "libx264",
+          "-preset",
+          reencodePreset,
+          "-crf",
+          reencodeCrf,
+          "-pix_fmt",
+          "yuv420p",
+          "-c:a",
+          "aac",
+          "-b:a",
+          reencodeAudioBitrate,
+          segmentPath
+        );
+
+        const exitCode = await runCommandWithFrameProgress(
+          reencodeArgs,
+          `reencode-segment-${index}`,
+          segmentFrameBudgets[index] ?? 0
+        );
+
+        if (exitCode !== 0) {
+          throw new Error("Export failed while re-encoding timeline segment.");
+        }
+      }
+
+      if (segmentPaths.length === 1) {
+        const cloneExitCode = await runCommandWithFrameProgress(
+          [
+            "-nostdin",
+            "-y",
+            "-i",
+            segmentPaths[0],
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            timelineOutputPath
+          ],
+          "reencode-finalize-single",
+          0
+        );
+        if (cloneExitCode !== 0) {
+          throw new Error("Export failed while finalizing single segment.");
+        }
+      } else {
+        await ffmpeg.writeFile(
+          inputListPath,
+          segmentPaths.map((path) => `file '${path}'`).join("\n")
+        );
+
+        let concatExitCode = await runCommandWithFrameProgress(
+          [
+            "-nostdin",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            inputListPath,
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            timelineOutputPath
+          ],
+          "reencode-concat-copy",
+          0
+        );
+
+        if (concatExitCode !== 0) {
+          frameTracker.addPlannedFrames(timelineFrameBudget);
+          concatExitCode = await runCommandWithFrameProgress(
+            [
+              "-nostdin",
+              "-y",
+              "-f",
+              "concat",
+              "-safe",
+              "0",
+              "-i",
+              inputListPath,
+              "-c:v",
+              "libx264",
+              "-preset",
+              reencodePreset,
+              "-crf",
+              reencodeCrf,
+              "-c:a",
+              "aac",
+              "-b:a",
+              reencodeAudioBitrate,
+              "-movflags",
+              "+faststart",
+              timelineOutputPath
+            ],
+            "reencode-concat-transcode",
+            timelineFrameBudget
+          );
+        }
+
+        if (concatExitCode !== 0) {
+          throw new Error("Export failed while concatenating segments.");
+        }
       }
     }
-  }
 
-  try {
     if (exportFormat !== "mp4") {
       options.onStageChange?.("finalizing", `Converting to ${exportFormat.toUpperCase()}...`);
-      options.onProgress?.(0.92);
+      if (exportFormat === "gif") {
+        frameTracker.addPlannedFrames(timelineFrameBudget * 2);
+      } else {
+        frameTracker.addPlannedFrames(timelineFrameBudget);
+      }
 
       if (exportFormat === "gif") {
         const palettePath = `${runId}-palette.png`;
@@ -560,8 +699,7 @@ export async function exportEditedTimeline(
         const gifFps = targetFps ?? 15;
         const gifFilter = `fps=${gifFps}`;
 
-        const paletteExitCode = await execWithDebug(
-          ffmpeg,
+        const paletteExitCode = await runCommandWithFrameProgress(
           [
             "-nostdin",
             "-y",
@@ -573,14 +711,14 @@ export async function exportEditedTimeline(
             `${gifFilter},palettegen`,
             palettePath
           ],
-          "format-gif-palette"
+          "format-gif-palette",
+          timelineFrameBudget
         );
         if (paletteExitCode !== 0) {
           throw new Error("Failed while generating GIF palette.");
         }
 
-        const gifExitCode = await execWithDebug(
-          ffmpeg,
+        const gifExitCode = await runCommandWithFrameProgress(
           [
             "-nostdin",
             "-y",
@@ -593,7 +731,8 @@ export async function exportEditedTimeline(
             "-an",
             finalOutputPath
           ],
-          "format-gif-encode"
+          "format-gif-encode",
+          timelineFrameBudget
         );
         if (gifExitCode !== 0) {
           throw new Error("Failed while encoding GIF output.");
@@ -659,7 +798,11 @@ export async function exportEditedTimeline(
         }
 
         formatArgs.push(finalOutputPath);
-        const convertExitCode = await execWithDebug(ffmpeg, formatArgs, `format-${exportFormat}`);
+        const convertExitCode = await runCommandWithFrameProgress(
+          formatArgs,
+          `format-${exportFormat}`,
+          timelineFrameBudget
+        );
         if (convertExitCode !== 0) {
           throw new Error(`Failed while converting output to ${exportFormat}.`);
         }
@@ -667,14 +810,14 @@ export async function exportEditedTimeline(
     }
 
     options.onStageChange?.("finalizing", "Finalizing exported video...");
-    options.onProgress?.(0.97);
     const outputData = await ffmpeg.readFile(finalOutputPath);
     if (!(outputData instanceof Uint8Array)) {
       throw new Error("Unexpected export output format.");
     }
-    options.onProgress?.(1);
+    frameTracker.markComplete();
     return toBlob(outputData, formatConfig.mimeType);
   } finally {
+    ffmpeg.off("progress", progressListener);
     await cleanupFiles(ffmpeg, [
       ...sourcePaths,
       ...segmentPaths,
