@@ -9,11 +9,20 @@ export type ExportStage =
   | "finalizing";
 
 export type ExportMode = "fit" | "fast";
-export type ExportFormat = "mp4" | "mov" | "avi" | "webm" | "mkv" | "gif";
+export type ExportFormat =
+  | "mp4"
+  | "mov"
+  | "avi"
+  | "mkv"
+  | "gif"
+  | "mp3"
+  | "wav";
 
 interface ExportFormatConfig {
   extension: string;
   mimeType: string;
+  supportsVideo: boolean;
+  supportsAudio: boolean;
 }
 
 export interface ExportSegment {
@@ -31,6 +40,10 @@ export interface ExportOptions {
   outputWidth?: number;
   outputHeight?: number;
   fps?: number;
+  includeVideo?: boolean;
+  includeAudio?: boolean;
+  videoBitrateKbps?: number;
+  audioBitrateKbps?: number;
   onStageChange?: (stage: ExportStage, message: string) => void;
   onProgress?: (value: number) => void;
   onFrameProgress?: (currentFrame: number, totalFrames: number, percent: number) => void;
@@ -65,6 +78,23 @@ function normalizeOptionalFps(value: number | undefined): number | null {
   }
   const rounded = Math.round(value as number);
   return Math.min(120, Math.max(1, rounded));
+}
+
+function normalizeOptionalBitrateKbps(
+  value: number | undefined,
+  min: number,
+  max: number
+): number | null {
+  if (!Number.isFinite(value)) {
+    return null;
+  }
+
+  const rounded = Math.round(value as number);
+  if (rounded <= 0) {
+    return null;
+  }
+
+  return Math.min(max, Math.max(min, rounded));
 }
 
 function normalizeSpeed(value: number): number {
@@ -109,6 +139,51 @@ function toFrameCount(durationSec: number, fps: number): number {
   }
   return Math.max(1, Math.round(durationSec * fps));
 }
+
+const EXPORT_FORMAT_CONFIG: Record<ExportFormat, ExportFormatConfig> = {
+  mp4: {
+    extension: "mp4",
+    mimeType: "video/mp4",
+    supportsVideo: true,
+    supportsAudio: true
+  },
+  mov: {
+    extension: "mov",
+    mimeType: "video/quicktime",
+    supportsVideo: true,
+    supportsAudio: true
+  },
+  avi: {
+    extension: "avi",
+    mimeType: "video/x-msvideo",
+    supportsVideo: true,
+    supportsAudio: true
+  },
+  mkv: {
+    extension: "mkv",
+    mimeType: "video/x-matroska",
+    supportsVideo: true,
+    supportsAudio: true
+  },
+  gif: {
+    extension: "gif",
+    mimeType: "image/gif",
+    supportsVideo: true,
+    supportsAudio: false
+  },
+  mp3: {
+    extension: "mp3",
+    mimeType: "audio/mpeg",
+    supportsVideo: false,
+    supportsAudio: true
+  },
+  wav: {
+    extension: "wav",
+    mimeType: "audio/wav",
+    supportsVideo: false,
+    supportsAudio: true
+  }
+};
 
 class FrameProgressTracker {
   private plannedFrames = 0;
@@ -192,21 +267,8 @@ class FrameProgressTracker {
   }
 }
 
-function getFormatConfig(format: ExportFormat): ExportFormatConfig {
-  switch (format) {
-    case "mov":
-      return { extension: "mov", mimeType: "video/quicktime" };
-    case "avi":
-      return { extension: "avi", mimeType: "video/x-msvideo" };
-    case "webm":
-      return { extension: "webm", mimeType: "video/webm" };
-    case "mkv":
-      return { extension: "mkv", mimeType: "video/x-matroska" };
-    case "gif":
-      return { extension: "gif", mimeType: "image/gif" };
-    default:
-      return { extension: "mp4", mimeType: "video/mp4" };
-  }
+export function getExportFormatConfig(format: ExportFormat): ExportFormatConfig {
+  return EXPORT_FORMAT_CONFIG[format];
 }
 
 async function cleanupFiles(ffmpeg: Awaited<ReturnType<typeof getFFmpeg>>, paths: string[]) {
@@ -231,10 +293,19 @@ async function execWithDebug(
   args: string[],
   label: string
 ): Promise<number> {
-  console.log(`[ffmpeg.exec:${label}] ${args.join(" ")}`);
+  const normalizedArgs = args.map((arg, index) => {
+    if (typeof arg !== "string") {
+      throw new Error(
+        `Invalid ffmpeg argument at index ${index} for ${label}. Expected string, got ${typeof arg}.`
+      );
+    }
+    return arg;
+  });
+
+  console.log(`[ffmpeg.exec:${label}] ${normalizedArgs.join(" ")}`);
   const startedAt = performance.now();
   try {
-    const exitCode = await ffmpeg.exec(args);
+    const exitCode = await ffmpeg.exec(normalizedArgs);
     const elapsedMs = Math.round(performance.now() - startedAt);
     console.log(`[ffmpeg.exit:${label}] code=${exitCode} elapsedMs=${elapsedMs}`);
     return exitCode;
@@ -288,7 +359,19 @@ export async function exportEditedTimeline(
 
   const exportMode = options.mode ?? "fit";
   const exportFormat = options.format ?? "mp4";
-  const formatConfig = getFormatConfig(exportFormat);
+  const formatConfig = getExportFormatConfig(exportFormat);
+  const includeVideo = formatConfig.supportsVideo && (options.includeVideo ?? true);
+  const includeAudio = formatConfig.supportsAudio && (options.includeAudio ?? true);
+  if (!includeVideo && !includeAudio) {
+    throw new Error("Enable at least one stream (video or audio) before exporting.");
+  }
+
+  const videoBitrateKbps = includeVideo
+    ? normalizeOptionalBitrateKbps(options.videoBitrateKbps, 100, 200_000)
+    : null;
+  const audioBitrateKbps = includeAudio
+    ? normalizeOptionalBitrateKbps(options.audioBitrateKbps, 8, 3_200)
+    : null;
   const requestedWidth =
     Number.isFinite(options.outputWidth) && (options.outputWidth as number) > 0
       ? toEvenDimension(options.outputWidth as number)
@@ -309,11 +392,18 @@ export async function exportEditedTimeline(
     (segment) => segment.width !== targetWidth || segment.height !== targetHeight
   );
   const hasSpeedChange = sanitizedSegments.some((segment) => !isSpeedNeutral(segment.speed));
-  const shouldNormalize = exportMode === "fit" && hasResolutionMismatch;
-  const shouldStretchResize = exportMode === "fast" && hasCustomResolution && hasResolutionMismatch;
-  const shouldApplyFps = targetFps !== null;
+  const shouldNormalize = includeVideo && exportMode === "fit" && hasResolutionMismatch;
+  const shouldStretchResize =
+    includeVideo && exportMode === "fast" && hasCustomResolution && hasResolutionMismatch;
+  const shouldApplyFps = includeVideo && targetFps !== null;
   const canUseFastPath =
     !shouldNormalize && !shouldStretchResize && !shouldApplyFps && !hasSpeedChange;
+  const needsFinalConvert =
+    exportFormat !== "mp4" ||
+    !includeVideo ||
+    !includeAudio ||
+    videoBitrateKbps !== null ||
+    audioBitrateKbps !== null;
   const baseFilters: string[] = [];
   if (shouldNormalize) {
     baseFilters.push(fitScaleFilter);
@@ -333,11 +423,24 @@ export async function exportEditedTimeline(
     return toFrameCount(timelineDuration, progressFps);
   });
   const timelineFrameBudget = segmentFrameBudgets.reduce((sum, frames) => sum + frames, 0);
+  const fastPathFrameBudget =
+    canUseFastPath && !needsFinalConvert ? timelineFrameBudget : 0;
+  const reencodeFrameBudget = canUseFastPath ? 0 : timelineFrameBudget;
+  const finalConvertFrameBudget = needsFinalConvert
+    ? exportFormat === "gif"
+      ? timelineFrameBudget * 2
+      : timelineFrameBudget
+    : 0;
+  const baselinePlannedFrameBudget =
+    fastPathFrameBudget + reencodeFrameBudget + finalConvertFrameBudget;
+  const trackedFastSegmentFrameBudgets =
+    fastPathFrameBudget > 0 ? segmentFrameBudgets : segmentFrameBudgets.map(() => 0);
   const frameTracker = new FrameProgressTracker(options);
 
   options.onStageChange?.("loading-core", "Loading FFmpeg core...");
   options.onProgress?.(0);
-  options.onFrameProgress?.(0, timelineFrameBudget, 0);
+  options.onFrameProgress?.(0, Math.max(1, baselinePlannedFrameBudget), 0);
+  frameTracker.addPlannedFrames(baselinePlannedFrameBudget);
   const ffmpeg = await getFFmpeg();
   attachFfmpegDebugListener(ffmpeg);
   let activeCommandTracking = false;
@@ -352,6 +455,10 @@ export async function exportEditedTimeline(
     segmentCount: sanitizedSegments.length,
     exportMode,
     exportFormat,
+    includeVideo,
+    includeAudio,
+    videoBitrateKbps,
+    audioBitrateKbps,
     hasCustomResolution,
     hasResolutionMismatch,
     hasSpeedChange,
@@ -359,11 +466,16 @@ export async function exportEditedTimeline(
     targetWidth,
     targetHeight,
     canUseFastPath,
+    needsFinalConvert,
     shouldStretchResize,
     shouldNormalize,
     reencodePreset,
     reencodeCrf,
-    reencodeAudioBitrate
+    reencodeAudioBitrate,
+    fastPathFrameBudget,
+    reencodeFrameBudget,
+    finalConvertFrameBudget,
+    baselinePlannedFrameBudget
   });
 
   const runId = `export-${Date.now().toString(36)}`;
@@ -372,8 +484,9 @@ export async function exportEditedTimeline(
   const tempPaths: string[] = [];
   const inputListPath = `${runId}-segments.txt`;
   const timelineOutputPath = `${runId}-timeline.mp4`;
-  const finalOutputPath =
-    exportFormat === "mp4" ? timelineOutputPath : `${runId}-output.${formatConfig.extension}`;
+  const finalOutputPath = needsFinalConvert
+    ? `${runId}-output.${formatConfig.extension}`
+    : timelineOutputPath;
 
   const fileKeyToPath = new Map<string, string>();
 
@@ -398,10 +511,6 @@ export async function exportEditedTimeline(
 
   try {
     try {
-      if (canUseFastPath) {
-        frameTracker.addPlannedFrames(timelineFrameBudget);
-      }
-
       options.onStageChange?.("preparing-inputs", "Writing source files...");
 
       for (const [index, segment] of sanitizedSegments.entries()) {
@@ -451,7 +560,7 @@ export async function exportEditedTimeline(
             segmentPath
           ],
           `fast-segment-${index}`,
-          segmentFrameBudgets[index] ?? 0
+          trackedFastSegmentFrameBudgets[index] ?? 0
         );
 
         if (exitCode !== 0) {
@@ -512,7 +621,9 @@ export async function exportEditedTimeline(
         throw error;
       }
 
-      frameTracker.addPlannedFrames(timelineFrameBudget);
+      if (canUseFastPath) {
+        frameTracker.addPlannedFrames(timelineFrameBudget);
+      }
 
       const fallbackNeedsStretch =
         hasResolutionMismatch && exportMode === "fast" && !shouldNormalize && !shouldStretchResize;
@@ -545,12 +656,12 @@ export async function exportEditedTimeline(
         const duration = segment.endSec - segment.startSec;
         const segmentPath = segmentPaths[index];
         const segmentVideoFilters = [...reencodeBaseFilters];
-        if (!isSpeedNeutral(segment.speed)) {
+        if (includeVideo && !isSpeedNeutral(segment.speed)) {
           segmentVideoFilters.push(`setpts=PTS/${segment.speed.toFixed(6)}`);
         }
         const segmentVideoFilter =
           segmentVideoFilters.length > 0 ? segmentVideoFilters.join(",") : null;
-        const segmentAudioFilter = !isSpeedNeutral(segment.speed)
+        const segmentAudioFilter = includeAudio && !isSpeedNeutral(segment.speed)
           ? buildAtempoFilter(segment.speed)
           : null;
         const reencodeArgs: string[] = [
@@ -561,12 +672,20 @@ export async function exportEditedTimeline(
           "-t",
           toFfmpegSeconds(duration),
           "-i",
-          sourcePath,
-          "-map",
-          "0:v:0?",
-          "-map",
-          "0:a:0?"
+          sourcePath
         ];
+
+        if (includeVideo) {
+          reencodeArgs.push("-map", "0:v:0?");
+        } else {
+          reencodeArgs.push("-vn");
+        }
+
+        if (includeAudio) {
+          reencodeArgs.push("-map", "0:a:0?");
+        } else {
+          reencodeArgs.push("-an");
+        }
 
         if (segmentVideoFilter) {
           reencodeArgs.push("-vf", segmentVideoFilter);
@@ -576,21 +695,24 @@ export async function exportEditedTimeline(
           reencodeArgs.push("-af", segmentAudioFilter);
         }
 
-        reencodeArgs.push(
-          "-c:v",
-          "libx264",
-          "-preset",
-          reencodePreset,
-          "-crf",
-          reencodeCrf,
-          "-pix_fmt",
-          "yuv420p",
-          "-c:a",
-          "aac",
-          "-b:a",
-          reencodeAudioBitrate,
-          segmentPath
-        );
+        if (includeVideo) {
+          reencodeArgs.push(
+            "-c:v",
+            "libx264",
+            "-preset",
+            reencodePreset,
+            "-crf",
+            reencodeCrf,
+            "-pix_fmt",
+            "yuv420p"
+          );
+        }
+
+        if (includeAudio) {
+          reencodeArgs.push("-c:a", "aac", "-b:a", reencodeAudioBitrate);
+        }
+
+        reencodeArgs.push(segmentPath);
 
         const exitCode = await runCommandWithFrameProgress(
           reencodeArgs,
@@ -650,30 +772,47 @@ export async function exportEditedTimeline(
 
         if (concatExitCode !== 0) {
           frameTracker.addPlannedFrames(timelineFrameBudget);
-          concatExitCode = await runCommandWithFrameProgress(
-            [
-              "-nostdin",
-              "-y",
-              "-f",
-              "concat",
-              "-safe",
-              "0",
-              "-i",
-              inputListPath,
+          const concatTranscodeArgs: string[] = [
+            "-nostdin",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            inputListPath
+          ];
+          if (includeVideo) {
+            concatTranscodeArgs.push(
+              "-map",
+              "0:v:0?",
               "-c:v",
               "libx264",
               "-preset",
               reencodePreset,
               "-crf",
               reencodeCrf,
+              "-pix_fmt",
+              "yuv420p"
+            );
+          } else {
+            concatTranscodeArgs.push("-vn");
+          }
+          if (includeAudio) {
+            concatTranscodeArgs.push(
+              "-map",
+              "0:a:0?",
               "-c:a",
               "aac",
               "-b:a",
-              reencodeAudioBitrate,
-              "-movflags",
-              "+faststart",
-              timelineOutputPath
-            ],
+              reencodeAudioBitrate
+            );
+          } else {
+            concatTranscodeArgs.push("-an");
+          }
+          concatTranscodeArgs.push("-movflags", "+faststart", timelineOutputPath);
+          concatExitCode = await runCommandWithFrameProgress(
+            concatTranscodeArgs,
             "reencode-concat-transcode",
             timelineFrameBudget
           );
@@ -685,13 +824,8 @@ export async function exportEditedTimeline(
       }
     }
 
-    if (exportFormat !== "mp4") {
-      options.onStageChange?.("finalizing", `Converting to ${exportFormat.toUpperCase()}...`);
-      if (exportFormat === "gif") {
-        frameTracker.addPlannedFrames(timelineFrameBudget * 2);
-      } else {
-        frameTracker.addPlannedFrames(timelineFrameBudget);
-      }
+    if (needsFinalConvert) {
+      options.onStageChange?.("finalizing", `Converting to .${formatConfig.extension}...`);
 
       if (exportFormat === "gif") {
         const palettePath = `${runId}-palette.png`;
@@ -738,63 +872,73 @@ export async function exportEditedTimeline(
           throw new Error("Failed while encoding GIF output.");
         }
       } else {
-        const formatArgs: string[] = [
-          "-nostdin",
-          "-y",
-          "-i",
-          timelineOutputPath,
-          "-map",
-          "0:v:0",
-          "-map",
-          "0:a:0?"
-        ];
+        const formatArgs: string[] = ["-nostdin", "-y", "-i", timelineOutputPath];
+        if (includeVideo) {
+          formatArgs.push("-map", "0:v:0?");
+        } else {
+          formatArgs.push("-vn");
+        }
+        if (includeAudio) {
+          formatArgs.push("-map", "0:a:0?");
+        } else {
+          formatArgs.push("-an");
+        }
 
-        if (exportFormat === "mov" || exportFormat === "mkv") {
-          formatArgs.push(
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "23",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k"
-          );
-          if (exportFormat === "mov") {
-            formatArgs.push("-movflags", "+faststart");
+        switch (exportFormat) {
+          case "mp4":
+          case "mov":
+          case "mkv": {
+            if (includeVideo) {
+              formatArgs.push(
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-pix_fmt",
+                "yuv420p"
+              );
+              if (videoBitrateKbps !== null) {
+                formatArgs.push("-b:v", `${videoBitrateKbps}k`);
+              }
+            }
+            if (includeAudio) {
+              formatArgs.push("-c:a", "aac", "-b:a", `${audioBitrateKbps ?? 128}k`);
+            }
+            if (exportFormat === "mov") {
+              formatArgs.push("-movflags", "+faststart");
+            }
+            break;
           }
-        } else if (exportFormat === "avi") {
-          formatArgs.push(
-            "-c:v",
-            "mpeg4",
-            "-q:v",
-            "5",
-            "-c:a",
-            "libmp3lame",
-            "-b:a",
-            "128k"
-          );
-        } else if (exportFormat === "webm") {
-          formatArgs.push(
-            "-c:v",
-            "libvpx",
-            "-b:v",
-            "0",
-            "-crf",
-            "32",
-            "-deadline",
-            "realtime",
-            "-cpu-used",
-            "5",
-            "-c:a",
-            "libopus",
-            "-b:a",
-            "96k"
-          );
+          case "avi": {
+            if (includeVideo) {
+              formatArgs.push("-c:v", "mpeg4", "-q:v", "5");
+              if (videoBitrateKbps !== null) {
+                formatArgs.push("-b:v", `${videoBitrateKbps}k`);
+              }
+            }
+            if (includeAudio) {
+              formatArgs.push("-c:a", "libmp3lame", "-b:a", `${audioBitrateKbps ?? 128}k`);
+            }
+            break;
+          }
+          case "mp3": {
+            if (!includeAudio) {
+              throw new Error("MP3 export requires audio enabled.");
+            }
+            formatArgs.push("-vn", "-c:a", "libmp3lame", "-b:a", `${audioBitrateKbps ?? 192}k`);
+            break;
+          }
+          case "wav": {
+            if (!includeAudio) {
+              throw new Error("WAV export requires audio enabled.");
+            }
+            formatArgs.push("-vn", "-c:a", "pcm_s16le");
+            break;
+          }
+          default:
+            throw new Error(`Unsupported export format: ${exportFormat}`);
         }
 
         formatArgs.push(finalOutputPath);

@@ -10,6 +10,7 @@ import {
 } from "react";
 import {
   exportEditedTimeline,
+  getExportFormatConfig,
   type ExportFormat,
   type ExportMode,
   type ExportStage
@@ -78,9 +79,10 @@ const EXPORT_FORMAT_OPTIONS: Array<{ value: ExportFormat; label: string }> = [
   { value: "mp4", label: "MP4 (H.264)" },
   { value: "mov", label: "MOV (QuickTime)" },
   { value: "avi", label: "AVI" },
-  { value: "webm", label: "WebM" },
-  { value: "mkv", label: "MKV" },
-  { value: "gif", label: "Animated GIF" }
+  { value: "mkv", label: "MKV (H.264)" },
+  { value: "gif", label: "Animated GIF" },
+  { value: "mp3", label: "MP3 (Audio Only)" },
+  { value: "wav", label: "WAV (Audio Only)" }
 ];
 
 const MIN_EDIT_GAP_SEC = 0.1;
@@ -387,6 +389,11 @@ function App() {
   const [exportWidthInput, setExportWidthInput] = useState("");
   const [exportHeightInput, setExportHeightInput] = useState("");
   const [exportFpsInput, setExportFpsInput] = useState("");
+  const [isExportAdvancedOpen, setIsExportAdvancedOpen] = useState(false);
+  const [includeVideoInExport, setIncludeVideoInExport] = useState(true);
+  const [includeAudioInExport, setIncludeAudioInExport] = useState(true);
+  const [exportVideoBitrateInput, setExportVideoBitrateInput] = useState("");
+  const [exportAudioBitrateInput, setExportAudioBitrateInput] = useState("");
 
   const [isDraggingTrimEdge, setIsDraggingTrimEdge] = useState(false);
   const [activeTrimEdge, setActiveTrimEdge] = useState<"start" | "end" | null>(null);
@@ -472,6 +479,19 @@ function App() {
     }
     return Math.round(parsed);
   }, [exportFpsInput]);
+  const exportFormatConfig = useMemo(() => getExportFormatConfig(exportFormat), [exportFormat]);
+  const exportSupportsVideo = exportFormatConfig.supportsVideo;
+  const exportSupportsAudio = exportFormatConfig.supportsAudio;
+  const effectiveIncludeVideo = exportSupportsVideo
+    ? exportSupportsAudio
+      ? includeVideoInExport
+      : true
+    : false;
+  const effectiveIncludeAudio = exportSupportsAudio
+    ? exportSupportsVideo
+      ? includeAudioInExport
+      : true
+    : false;
   const frameReadoutFps = requestedExportFps ?? 30;
   const isFrameReadoutEstimated = requestedExportFps === null;
   const totalEditedFrames = Math.max(0, Math.round(editedDurationSec * frameReadoutFps));
@@ -540,6 +560,8 @@ function App() {
     : 0;
 
   const isBusy = isIngesting || isExporting;
+  const disableVideoToggle = isBusy || !exportSupportsVideo || !exportSupportsAudio;
+  const disableAudioToggle = isBusy || !exportSupportsAudio || !exportSupportsVideo;
   const exportProgressValue = Math.min(
     1,
     Math.max(0, exportFrameProgress?.percent ?? exportProgress)
@@ -609,12 +631,12 @@ function App() {
   }, [editedSegments]);
 
   useEffect(() => {
-    if (!hasEditedResolutionMismatch) {
+    if (!exportSupportsVideo || !hasEditedResolutionMismatch) {
       return;
     }
 
     setExportMode((previous) => (previous === "fit" ? previous : "fit"));
-  }, [hasEditedResolutionMismatch]);
+  }, [exportSupportsVideo, hasEditedResolutionMismatch]);
 
   useEffect(() => {
     if (!isExporting) {
@@ -1386,37 +1408,68 @@ function App() {
       return;
     }
 
+    const includeVideo = effectiveIncludeVideo;
+    const includeAudio = effectiveIncludeAudio;
+    if (!includeVideo && !includeAudio) {
+      setError("Enable video or audio before exporting.");
+      return;
+    }
+
     const widthValue = exportWidthInput.trim();
     const heightValue = exportHeightInput.trim();
     const fpsValue = exportFpsInput.trim();
+    const videoBitrateValue = exportVideoBitrateInput.trim();
+    const audioBitrateValue = exportAudioBitrateInput.trim();
 
     let exportWidth: number | undefined;
     let exportHeight: number | undefined;
     let exportFps: number | undefined;
+    let exportVideoBitrateKbps: number | undefined;
+    let exportAudioBitrateKbps: number | undefined;
 
-    if ((widthValue === "") !== (heightValue === "")) {
-      setError("Set both output width and height, or leave both empty.");
-      return;
-    }
-
-    if (widthValue !== "" && heightValue !== "") {
-      const parsedWidth = parsePositiveIntegerInput(widthValue);
-      const parsedHeight = parsePositiveIntegerInput(heightValue);
-      if (!parsedWidth || !parsedHeight || parsedWidth < 2 || parsedHeight < 2) {
-        setError("Output resolution must use positive integers.");
+    if (includeVideo) {
+      if ((widthValue === "") !== (heightValue === "")) {
+        setError("Set both output width and height, or leave both empty.");
         return;
       }
-      exportWidth = parsedWidth;
-      exportHeight = parsedHeight;
+
+      if (widthValue !== "" && heightValue !== "") {
+        const parsedWidth = parsePositiveIntegerInput(widthValue);
+        const parsedHeight = parsePositiveIntegerInput(heightValue);
+        if (!parsedWidth || !parsedHeight || parsedWidth < 2 || parsedHeight < 2) {
+          setError("Output resolution must use positive integers.");
+          return;
+        }
+        exportWidth = parsedWidth;
+        exportHeight = parsedHeight;
+      }
+
+      if (fpsValue !== "") {
+        const parsedFps = Number(fpsValue);
+        if (!Number.isFinite(parsedFps) || parsedFps < 1 || parsedFps > 120) {
+          setError("FPS must be between 1 and 120.");
+          return;
+        }
+        exportFps = Math.round(parsedFps);
+      }
     }
 
-    if (fpsValue !== "") {
-      const parsedFps = Number(fpsValue);
-      if (!Number.isFinite(parsedFps) || parsedFps < 1 || parsedFps > 120) {
-        setError("FPS must be between 1 and 120.");
+    if (includeVideo && videoBitrateValue !== "") {
+      const parsedVideoBitrate = parsePositiveIntegerInput(videoBitrateValue);
+      if (!parsedVideoBitrate || parsedVideoBitrate < 100 || parsedVideoBitrate > 200_000) {
+        setError("Video bitrate must be between 100 and 200000 kbps.");
         return;
       }
-      exportFps = Math.round(parsedFps);
+      exportVideoBitrateKbps = parsedVideoBitrate;
+    }
+
+    if (includeAudio && audioBitrateValue !== "") {
+      const parsedAudioBitrate = parsePositiveIntegerInput(audioBitrateValue);
+      if (!parsedAudioBitrate || parsedAudioBitrate < 8 || parsedAudioBitrate > 3_200) {
+        setError("Audio bitrate must be between 8 and 3200 kbps.");
+        return;
+      }
+      exportAudioBitrateKbps = parsedAudioBitrate;
     }
 
     setIsExporting(true);
@@ -1451,6 +1504,10 @@ function App() {
         outputWidth: exportWidth,
         outputHeight: exportHeight,
         fps: exportFps,
+        includeVideo,
+        includeAudio,
+        videoBitrateKbps: exportVideoBitrateKbps,
+        audioBitrateKbps: exportAudioBitrateKbps,
         onStageChange: (stage, message) => {
           setExportStage(stage);
           setExportStatusMessage(message);
@@ -1464,7 +1521,7 @@ function App() {
       const downloadUrl = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = downloadUrl;
-      anchor.download = `edited-video.${exportFormat}`;
+      anchor.download = `edited-video.${exportFormatConfig.extension}`;
       document.body.appendChild(anchor);
       anchor.click();
       anchor.remove();
@@ -1856,7 +1913,7 @@ function App() {
                     placeholder="Auto"
                     value={exportFpsInput}
                     onChange={(event) => setExportFpsInput(event.target.value)}
-                    disabled={isBusy}
+                    disabled={isBusy || !exportSupportsVideo}
                   />
                 </label>
 
@@ -1870,7 +1927,7 @@ function App() {
                     placeholder="Auto"
                     value={exportWidthInput}
                     onChange={(event) => setExportWidthInput(event.target.value)}
-                    disabled={isBusy}
+                    disabled={isBusy || !exportSupportsVideo}
                   />
                 </label>
 
@@ -1884,7 +1941,7 @@ function App() {
                     placeholder="Auto"
                     value={exportHeightInput}
                     onChange={(event) => setExportHeightInput(event.target.value)}
-                    disabled={isBusy}
+                    disabled={isBusy || !exportSupportsVideo}
                   />
                 </label>
               </div>
@@ -1900,7 +1957,7 @@ function App() {
                     setExportWidthInput(String(largestClipResolution.width));
                     setExportHeightInput(String(largestClipResolution.height));
                   }}
-                  disabled={isBusy || largestClipResolution.area <= 0}
+                  disabled={isBusy || largestClipResolution.area <= 0 || !exportSupportsVideo}
                 >
                   Use Largest Source
                 </button>
@@ -1911,16 +1968,98 @@ function App() {
                     setExportWidthInput("");
                     setExportHeightInput("");
                   }}
-                  disabled={isBusy}
+                  disabled={isBusy || !exportSupportsVideo}
                 >
                   Auto Resolution
                 </button>
+                <button
+                  className="button ghost tiny"
+                  type="button"
+                  onClick={() => setIsExportAdvancedOpen((previous) => !previous)}
+                  disabled={isBusy}
+                >
+                  {isExportAdvancedOpen ? "Hide Advanced" : "Show Advanced"}
+                </button>
               </div>
+
+              {isExportAdvancedOpen && (
+                <div className="export-advanced">
+                  <p className="export-settings-subtitle">Advanced</p>
+                  <div className="toggle-row">
+                    <label className={`toggle-item${disableVideoToggle ? " disabled" : ""}`}>
+                      <input
+                        type="checkbox"
+                        checked={effectiveIncludeVideo}
+                        onChange={(event) => {
+                          const nextValue = event.target.checked;
+                          if (!nextValue && !effectiveIncludeAudio) {
+                            return;
+                          }
+                          setIncludeVideoInExport(nextValue);
+                        }}
+                        disabled={disableVideoToggle}
+                      />
+                      Include Video
+                    </label>
+                    <label className={`toggle-item${disableAudioToggle ? " disabled" : ""}`}>
+                      <input
+                        type="checkbox"
+                        checked={effectiveIncludeAudio}
+                        onChange={(event) => {
+                          const nextValue = event.target.checked;
+                          if (!nextValue && !effectiveIncludeVideo) {
+                            return;
+                          }
+                          setIncludeAudioInExport(nextValue);
+                        }}
+                        disabled={disableAudioToggle}
+                      />
+                      Include Audio
+                    </label>
+                  </div>
+                  <div className="export-settings-grid export-advanced-grid">
+                    <label>
+                      Video Bitrate (kbps)
+                      <input
+                        className="time-input"
+                        type="number"
+                        min={100}
+                        max={200000}
+                        step={1}
+                        placeholder="Auto"
+                        value={exportVideoBitrateInput}
+                        onChange={(event) => setExportVideoBitrateInput(event.target.value)}
+                        disabled={isBusy || !effectiveIncludeVideo}
+                      />
+                    </label>
+                    <label>
+                      Audio Bitrate (kbps)
+                      <input
+                        className="time-input"
+                        type="number"
+                        min={8}
+                        max={3200}
+                        step={1}
+                        placeholder="Auto"
+                        value={exportAudioBitrateInput}
+                        onChange={(event) => setExportAudioBitrateInput(event.target.value)}
+                        disabled={isBusy || !effectiveIncludeAudio}
+                      />
+                    </label>
+                  </div>
+                  <p className="hint">Leave bitrate empty to use codec defaults.</p>
+                </div>
+              )}
 
               <p className="hint">
                 Resolution auto uses the largest source clip ({autoResolutionLabel}). FPS auto keeps source timing.
               </p>
-              {exportFormat === "gif" && <p className="hint">Animated GIF exports do not include audio.</p>}
+              {!exportSupportsVideo && (
+                <p className="hint">
+                  This format is audio-only. Resolution, FPS, and canvas mode are ignored.
+                </p>
+              )}
+              {!exportSupportsAudio && <p className="hint">This format does not support audio.</p>}
             </div>
 
             <div className="export-row">
@@ -1929,7 +2068,7 @@ function App() {
                   className={`button ghost tiny${exportMode === "fit" ? " active" : ""}`}
                   type="button"
                   onClick={() => setExportMode("fit")}
-                  disabled={isBusy}
+                  disabled={isBusy || !exportSupportsVideo}
                 >
                   Fit Canvas
                 </button>
@@ -1937,7 +2076,7 @@ function App() {
                   className={`button ghost tiny${exportMode === "fast" ? " active" : ""}`}
                   type="button"
                   onClick={() => setExportMode("fast")}
-                  disabled={isBusy}
+                  disabled={isBusy || !exportSupportsVideo}
                 >
                   Fast Copy
                 </button>
@@ -1954,9 +2093,11 @@ function App() {
             </div>
 
             <p className="hint">
-              {exportMode === "fit"
-                ? "Fit Canvas keeps one output resolution and avoids stretching, but is slower."
-                : "Fast Copy is quickest and may stretch/mismatch when source resolutions differ."}
+              {!exportSupportsVideo
+                ? "Audio-only formats ignore canvas mode."
+                : exportMode === "fit"
+                  ? "Fit Canvas keeps one output resolution and avoids stretching, but is slower."
+                  : "Fast Copy is quickest and may stretch/mismatch when source resolutions differ."}
             </p>
 
             {(isExporting || exportStage) && (

@@ -828,6 +828,22 @@ input[type="number"]::-webkit-inner-spin-button {
   margin-right: 0;
 }
 
+.export-advanced {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  padding: 10px;
+  background: rgba(3, 9, 20, 0.35);
+  display: grid;
+  gap: 8px;
+}
+
+.export-settings-subtitle {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--text-main);
+  font-weight: 600;
+}
+
 .toggle-row {
   display: grid;
   gap: 8px;
@@ -841,8 +857,16 @@ input[type="number"]::-webkit-inner-spin-button {
   color: var(--text-main);
 }
 
+.toggle-item.disabled {
+  color: var(--text-muted);
+}
+
 .toggle-item input {
   margin: 0;
+}
+
+.export-advanced-grid {
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
 }
 
 .preset-row {
