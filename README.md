@@ -2,6 +2,8 @@
 
 A simple, browser-based video editor where all processing runs on the user's device (no backend).
 
+Live demo (GitHub Pages): https://soadzoor.github.io/video-editor/
+
 ## Current Status
 
 - Timeline-first workflow implemented:
