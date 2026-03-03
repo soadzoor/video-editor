@@ -63,6 +63,7 @@ interface TrimWindowDragState {
   railWidthPx: number;
   initialStartSec: number;
   initialEndSec: number;
+  mode: "start" | "end";
 }
 
 interface PlayheadDragState {
@@ -88,10 +89,7 @@ const MIN_SEGMENT_SPEED = 0.001;
 const MAX_SEGMENT_SPEED = 1000;
 const MIN_SEGMENT_SPEED_LOG = Math.log10(MIN_SEGMENT_SPEED);
 const MAX_SEGMENT_SPEED_LOG = Math.log10(MAX_SEGMENT_SPEED);
-const TRIM_SLIDER_STEP_SEC = 0.001;
-const TRIM_ARROW_STEP_DEFAULT_SEC = 0.001;
-const TRIM_ARROW_STEP_ALT_SEC = 0.01;
-const TRIM_ARROW_STEP_SHIFT_SEC = 0.1;
+const TRIM_SNAP_STEP_SEC = 0.001;
 
 function makeId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -390,7 +388,8 @@ function App() {
   const [exportHeightInput, setExportHeightInput] = useState("");
   const [exportFpsInput, setExportFpsInput] = useState("");
 
-  const [isDraggingTrimWindow, setIsDraggingTrimWindow] = useState(false);
+  const [isDraggingTrimEdge, setIsDraggingTrimEdge] = useState(false);
+  const [activeTrimEdge, setActiveTrimEdge] = useState<"start" | "end" | null>(null);
   const [isDraggingPlayhead, setIsDraggingPlayhead] = useState(false);
   const [selectedSpeedInput, setSelectedSpeedInput] = useState("");
   const [isPreviewSupported] = useState(
@@ -769,7 +768,7 @@ function App() {
   }, [timelineDurationSec, trimEndSec, trimStartSec]);
 
   useEffect(() => {
-    if (!isDraggingTrimWindow) {
+    if (!isDraggingTrimEdge) {
       return;
     }
 
@@ -787,16 +786,11 @@ function App() {
 
       const deltaSec =
         ((event.clientX - drag.startClientX) / drag.railWidthPx) * timelineDurationSec;
-      const windowDuration = Math.max(
-        Math.min(MIN_EDIT_GAP_SEC, timelineDurationSec),
-        drag.initialEndSec - drag.initialStartSec
-      );
-      const maxStart = Math.max(0, timelineDurationSec - windowDuration);
-      const nextStart = clamp(drag.initialStartSec + deltaSec, 0, maxStart);
-      const nextEnd = nextStart + windowDuration;
-
-      setTrimStartSec(nextStart);
-      setTrimEndSec(nextEnd);
+      if (drag.mode === "start") {
+        applyTrimStart(drag.initialStartSec + deltaSec);
+      } else {
+        applyTrimEnd(drag.initialEndSec + deltaSec);
+      }
     };
 
     const stopDragging = (event?: PointerEvent): void => {
@@ -808,7 +802,8 @@ function App() {
         return;
       }
       trimWindowDragRef.current = null;
-      setIsDraggingTrimWindow(false);
+      setIsDraggingTrimEdge(false);
+      setActiveTrimEdge(null);
     };
 
     window.addEventListener("pointermove", handlePointerMove, { passive: false });
@@ -820,18 +815,19 @@ function App() {
       window.removeEventListener("pointerup", stopDragging);
       window.removeEventListener("pointercancel", stopDragging);
     };
-  }, [isDraggingTrimWindow, timelineDurationSec]);
+  }, [isDraggingTrimEdge, timelineDurationSec]);
 
   useEffect(() => {
-    if (!isDraggingTrimWindow) {
+    if (!isDraggingTrimEdge) {
       return;
     }
 
     if (isBusy || timelineDurationSec <= 0) {
       trimWindowDragRef.current = null;
-      setIsDraggingTrimWindow(false);
+      setIsDraggingTrimEdge(false);
+      setActiveTrimEdge(null);
     }
-  }, [isBusy, isDraggingTrimWindow, timelineDurationSec]);
+  }, [isBusy, isDraggingTrimEdge, timelineDurationSec]);
 
   useEffect(() => {
     if (!isDraggingPlayhead) {
@@ -1073,7 +1069,7 @@ function App() {
 
   function applyTrimStart(nextValueSec: number): void {
     const maxStart = Math.max(0, trimEndSec - minTrimGapSec);
-    const snapThreshold = TRIM_SLIDER_STEP_SEC * 1.5;
+    const snapThreshold = TRIM_SNAP_STEP_SEC * 1.5;
     let bounded = clamp(nextValueSec, 0, maxStart);
     if (bounded <= snapThreshold) {
       bounded = 0;
@@ -1086,7 +1082,7 @@ function App() {
 
   function applyTrimEnd(nextValueSec: number): void {
     const minEnd = Math.min(timelineDurationSec, trimStartSec + minTrimGapSec);
-    const snapThreshold = TRIM_SLIDER_STEP_SEC * 1.5;
+    const snapThreshold = TRIM_SNAP_STEP_SEC * 1.5;
     let bounded = clamp(nextValueSec, minEnd, timelineDurationSec);
     if (timelineDurationSec - bounded <= snapThreshold) {
       bounded = timelineDurationSec;
@@ -1095,52 +1091,6 @@ function App() {
     }
     bounded = normalizeTimeValue(bounded);
     setTrimEndSec((previous) => (nearlyEqual(previous, bounded) ? previous : bounded));
-  }
-
-  function trimArrowStep(event: React.KeyboardEvent<HTMLInputElement>): number {
-    if (event.shiftKey) {
-      return TRIM_ARROW_STEP_SHIFT_SEC;
-    }
-    if (event.altKey) {
-      return TRIM_ARROW_STEP_ALT_SEC;
-    }
-    return TRIM_ARROW_STEP_DEFAULT_SEC;
-  }
-
-  function handleTrimStartKeyDown(event: React.KeyboardEvent<HTMLInputElement>): void {
-    if (isBusy) {
-      return;
-    }
-    if (
-      event.key !== "ArrowLeft" &&
-      event.key !== "ArrowRight" &&
-      event.key !== "ArrowUp" &&
-      event.key !== "ArrowDown"
-    ) {
-      return;
-    }
-
-    event.preventDefault();
-    const direction = event.key === "ArrowRight" || event.key === "ArrowUp" ? 1 : -1;
-    applyTrimStart(trimStartSec + direction * trimArrowStep(event));
-  }
-
-  function handleTrimEndKeyDown(event: React.KeyboardEvent<HTMLInputElement>): void {
-    if (isBusy) {
-      return;
-    }
-    if (
-      event.key !== "ArrowLeft" &&
-      event.key !== "ArrowRight" &&
-      event.key !== "ArrowUp" &&
-      event.key !== "ArrowDown"
-    ) {
-      return;
-    }
-
-    event.preventDefault();
-    const direction = event.key === "ArrowRight" || event.key === "ArrowUp" ? 1 : -1;
-    applyTrimEnd(trimEndSec + direction * trimArrowStep(event));
   }
 
   async function togglePlayPause(): Promise<void> {
@@ -1242,7 +1192,10 @@ function App() {
     seekToTimelinePosition(rawPosition, isPlaying);
   }
 
-  function handleTrimWindowPointerDown(event: ReactPointerEvent<HTMLDivElement>): void {
+  function handleTrimEdgePointerDown(
+    event: ReactPointerEvent<HTMLSpanElement>,
+    mode: "start" | "end"
+  ): void {
     if (event.button !== 0 || isBusy || timelineDurationSec <= 0 || trimEndSec <= trimStartSec) {
       return;
     }
@@ -1252,20 +1205,23 @@ function App() {
       return;
     }
 
-    const rect = rail.getBoundingClientRect();
-    if (rect.width <= 0) {
+    const railRect = rail.getBoundingClientRect();
+    if (railRect.width <= 0) {
       return;
     }
 
     event.preventDefault();
+    event.stopPropagation();
     trimWindowDragRef.current = {
       pointerId: event.pointerId,
       startClientX: event.clientX,
-      railWidthPx: rect.width,
+      railWidthPx: railRect.width,
       initialStartSec: trimStartSec,
-      initialEndSec: trimEndSec
+      initialEndSec: trimEndSec,
+      mode
     };
-    setIsDraggingTrimWindow(true);
+    setActiveTrimEdge(mode);
+    setIsDraggingTrimEdge(true);
   }
 
   function handlePlayheadPointerDown(event: ReactPointerEvent<HTMLDivElement>): void {
@@ -1678,10 +1634,11 @@ function App() {
                 />
 
                 <div className={`timeline-track${timelineTool === "razor" ? " razor" : ""}`}>
-                  {timelineDisplayItems.map((item, index) => {
+                  {timelineDisplayItems.map((item) => {
                     const width =
                       timelineDurationSec > 0 ? (item.duration / timelineDurationSec) * 100 : 0;
                     const clip = clipById.get(item.sourceClipId);
+                    const clipFileName = clip?.file.name ?? "Unknown file";
                     const isSelected = item.id === selectedTimelineItemId;
                     const isDraggingItem = item.id === draggingTimelineItemId;
 
@@ -1700,11 +1657,11 @@ function App() {
                         onDragEnd={handleTimelineItemDragEnd}
                         draggable={!isBusy}
                         disabled={isBusy}
-                        title={`${clip?.file.name ?? "Clip"} · ${formatSecondsLabel(
+                        title={`File: ${clipFileName} · ${formatSecondsLabel(
                           item.sourceStart
                         )} -> ${formatSecondsLabel(item.sourceEnd)} · ${formatSpeedLabel(item.speed)}x`}
                       >
-                        <span className="timeline-segment-label">{index + 1}</span>
+                        <span className="timeline-segment-label">{clipFileName}</span>
                       </button>
                     );
                   })}
@@ -1718,49 +1675,29 @@ function App() {
                 />
 
                 <div
-                  className="trim-range-window"
+                  className={`trim-range-window${isDraggingTrimEdge ? " dragging" : ""}${
+                    activeTrimEdge === "start"
+                      ? " dragging-start"
+                      : activeTrimEdge === "end"
+                        ? " dragging-end"
+                        : ""
+                  }`}
                   style={{
                     left: `${trimStartPercent}%`,
                     right: `${trimRightPercent}%`
                   }}
-                />
-
-                <div
-                  className={`trim-window-grabber${isDraggingTrimWindow ? " dragging" : ""}`}
-                  style={{ left: `${(trimStartPercent + trimEndPercent) / 2}%` }}
-                  onPointerDown={handleTrimWindowPointerDown}
-                  title="Drag trim window"
-                />
-
-                <input
-                  className="trim-range trim-range-start"
-                  type="range"
-                  min={0}
-                  max={timelineDurationSec}
-                  step={TRIM_SLIDER_STEP_SEC}
-                  value={clamp(trimStartSec, 0, timelineDurationSec)}
-                  onChange={(event) => {
-                    applyTrimStart(Number(event.target.value));
-                  }}
-                  onKeyDown={handleTrimStartKeyDown}
-                  disabled={isBusy}
-                  aria-label="Trim start"
-                />
-
-                <input
-                  className="trim-range trim-range-end"
-                  type="range"
-                  min={0}
-                  max={timelineDurationSec}
-                  step={TRIM_SLIDER_STEP_SEC}
-                  value={clamp(trimEndSec, 0, timelineDurationSec)}
-                  onChange={(event) => {
-                    applyTrimEnd(Number(event.target.value));
-                  }}
-                  onKeyDown={handleTrimEndKeyDown}
-                  disabled={isBusy}
-                  aria-label="Trim end"
-                />
+                >
+                  <span
+                    className="trim-window-edge trim-window-edge-start"
+                    onPointerDown={(event) => handleTrimEdgePointerDown(event, "start")}
+                    title="Drag trim start edge"
+                  />
+                  <span
+                    className="trim-window-edge trim-window-edge-end"
+                    onPointerDown={(event) => handleTrimEdgePointerDown(event, "end")}
+                    title="Drag trim end edge"
+                  />
+                </div>
               </div>
 
               <div className="trim-rail-values">

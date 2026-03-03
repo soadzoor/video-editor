@@ -590,6 +590,13 @@ body {
 .timeline-segment-label {
   font-size: 0.76rem;
   line-height: 1;
+  display: block;
+  width: 100%;
+  padding: 0 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
 }
 
 .timeline-mask {
@@ -667,74 +674,38 @@ body {
   pointer-events: none;
 }
 
-.trim-window-grabber {
+.trim-range-window.dragging {
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.45),
+    0 0 0 1px rgba(127, 255, 210, 0.35);
+}
+
+.trim-window-edge {
   position: absolute;
-  z-index: 6;
-  top: 50%;
-  width: 34px;
-  height: 18px;
-  border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.45);
-  background: rgba(9, 18, 36, 0.72);
-  cursor: grab;
-  transform: translate(-50%, -50%);
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  pointer-events: auto;
+  cursor: ew-resize;
   touch-action: none;
 }
 
-.trim-window-grabber.dragging {
-  cursor: grabbing;
+.trim-window-edge-start {
+  left: 0;
+  background: rgba(127, 255, 210, 0.9);
 }
 
-.trim-range {
-  position: absolute;
-  inset: 0;
-  z-index: 5;
-  width: 100%;
-  margin: 0;
-  background: transparent;
-  -webkit-appearance: none;
-  appearance: none;
-  pointer-events: none;
+.trim-window-edge-end {
+  right: 0;
+  background: rgba(234, 243, 255, 0.9);
 }
 
-.trim-range::-webkit-slider-runnable-track {
-  height: 44px;
-  background: transparent;
+.trim-range-window.dragging-start .trim-window-edge-start {
+  background: rgba(127, 255, 210, 1);
 }
 
-.trim-range::-moz-range-track {
-  height: 44px;
-  background: transparent;
-}
-
-.trim-range::-webkit-slider-thumb {
-  -webkit-appearance: none;
-  appearance: none;
-  width: 14px;
-  height: 14px;
-  margin-top: 15px;
-  border-radius: 999px;
-  border: 2px solid #00180f;
-  background: var(--accent);
-  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.42);
-  cursor: ew-resize;
-  pointer-events: auto;
-}
-
-.trim-range::-moz-range-thumb {
-  width: 14px;
-  height: 14px;
-  border-radius: 999px;
-  border: 2px solid #00180f;
-  background: var(--accent);
-  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.42);
-  cursor: ew-resize;
-  pointer-events: auto;
-}
-
-.trim-range-end::-webkit-slider-thumb,
-.trim-range-end::-moz-range-thumb {
-  background: #eaf3ff;
+.trim-range-window.dragging-end .trim-window-edge-end {
+  background: rgba(234, 243, 255, 1);
 }
 
 .cut-list {
