@@ -1829,7 +1829,7 @@ function App() {
                 <label>
                   Format
                   <select
-                    className="time-input"
+                    className="time-input export-format-select"
                     value={exportFormat}
                     onChange={(event) => setExportFormat(event.target.value as ExportFormat)}
                     disabled={isBusy}
