@@ -355,6 +355,18 @@ function moveTimelineItem(
   return next;
 }
 
+function isKeyboardEventFromInteractiveElement(target: EventTarget | null): boolean {
+  if (!(target instanceof Element)) {
+    return false;
+  }
+
+  return (
+    target.closest(
+      "input, textarea, select, [contenteditable=''], [contenteditable='true'], [contenteditable='plaintext-only']"
+    ) !== null
+  );
+}
+
 function App() {
   const [clips, setClips] = useState<SourceClip[]>([]);
   const [timelineItems, setTimelineItems] = useState<TimelineItem[]>([]);
@@ -366,7 +378,7 @@ function App() {
 
   const [trimStartSec, setTrimStartSec] = useState(0);
   const [trimEndSec, setTrimEndSec] = useState(0);
-  const [editedPositionSec, setEditedPositionSec] = useState(0);
+  const [previewPositionSec, setPreviewPositionSec] = useState(0);
   const [, setCurrentSegmentIndex] = useState(0);
 
   const [timelineTool, setTimelineTool] = useState<TimelineTool>("select");
@@ -406,8 +418,9 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const previewCanvasRef = useRef<HTMLCanvasElement>(null);
   const previewEngineRef = useRef<TimelinePreviewEngine | null>(null);
-  const editedSegmentsRef = useRef<EditedSegment[]>([]);
+  const previewSegmentsRef = useRef<EditedSegment[]>([]);
   const clipsRef = useRef<SourceClip[]>([]);
+  const togglePlayPauseRef = useRef<() => void>(() => undefined);
 
   const trimRangeShellRef = useRef<HTMLDivElement>(null);
   const trimWindowDragRef = useRef<TrimWindowDragState | null>(null);
@@ -445,9 +458,15 @@ function App() {
     () => buildEditedSegments(timelineDisplayItems, trimStartSec, trimEndSec),
     [timelineDisplayItems, trimStartSec, trimEndSec]
   );
+  const previewTimelineSegments = useMemo(
+    () => buildEditedSegments(timelineDisplayItems, 0, timelineDurationSec),
+    [timelineDisplayItems, timelineDurationSec]
+  );
 
-  const editedDurationSec =
-    editedSegments.length > 0 ? editedSegments[editedSegments.length - 1].editedEnd : 0;
+  const previewDurationSec =
+    previewTimelineSegments.length > 0
+      ? previewTimelineSegments[previewTimelineSegments.length - 1].editedEnd
+      : 0;
   const hasEditedResolutionMismatch = useMemo(() => {
     if (editedSegments.length <= 1) {
       return false;
@@ -494,10 +513,10 @@ function App() {
     : false;
   const frameReadoutFps = requestedExportFps ?? 30;
   const isFrameReadoutEstimated = requestedExportFps === null;
-  const totalEditedFrames = Math.max(0, Math.round(editedDurationSec * frameReadoutFps));
-  const currentEditedFrame =
-    totalEditedFrames > 0
-      ? clamp(Math.floor(editedPositionSec * frameReadoutFps), 0, totalEditedFrames)
+  const totalPreviewFrames = Math.max(0, Math.round(previewDurationSec * frameReadoutFps));
+  const currentPreviewFrame =
+    totalPreviewFrames > 0
+      ? clamp(Math.floor(previewPositionSec * frameReadoutFps), 0, totalPreviewFrames)
       : 0;
 
   const minTrimGapSec = Math.min(MIN_EDIT_GAP_SEC, timelineDurationSec);
@@ -512,42 +531,10 @@ function App() {
       : 0;
   const trimRightPercent = Math.max(0, 100 - trimEndPercent);
 
-  const playheadRawSec = useMemo(() => {
-    if (timelineDurationSec <= 0) {
-      return 0;
-    }
-
-    if (editedSegments.length === 0) {
-      return clamp(trimStartSec, 0, timelineDurationSec);
-    }
-
-    if (editedPositionSec <= 0) {
-      return clamp(trimStartSec, 0, timelineDurationSec);
-    }
-
-    if (editedPositionSec >= editedDurationSec) {
-      return clamp(trimEndSec, 0, timelineDurationSec);
-    }
-
-    const segmentIndex = findSegmentIndex(editedSegments, editedPositionSec);
-    if (segmentIndex < 0) {
-      return clamp(trimStartSec, 0, timelineDurationSec);
-    }
-
-    const segment = editedSegments[segmentIndex];
-    return clamp(
-      segment.timelineStart + (editedPositionSec - segment.editedStart),
-      0,
-      timelineDurationSec
-    );
-  }, [
-    editedDurationSec,
-    editedPositionSec,
-    editedSegments,
-    timelineDurationSec,
-    trimEndSec,
-    trimStartSec
-  ]);
+  const playheadRawSec = useMemo(
+    () => clamp(previewPositionSec, 0, timelineDurationSec),
+    [previewPositionSec, timelineDurationSec]
+  );
 
   const playheadPercent =
     timelineDurationSec > 0 ? (clamp(playheadRawSec, 0, timelineDurationSec) / timelineDurationSec) * 100 : 0;
@@ -602,7 +589,7 @@ function App() {
   );
   const previewSegments = useMemo<PreviewSegment[]>(
     () =>
-      editedSegments.map((segment) => ({
+      previewTimelineSegments.map((segment) => ({
         id: segment.id,
         clipId: segment.clipId,
         sourceStart: segment.sourceStart,
@@ -611,7 +598,7 @@ function App() {
         editedStart: segment.editedStart,
         editedEnd: segment.editedEnd
       })),
-    [editedSegments]
+    [previewTimelineSegments]
   );
 
   useEffect(() => {
@@ -627,8 +614,8 @@ function App() {
   }, []);
 
   useEffect(() => {
-    editedSegmentsRef.current = editedSegments;
-  }, [editedSegments]);
+    previewSegmentsRef.current = previewTimelineSegments;
+  }, [previewTimelineSegments]);
 
   useEffect(() => {
     if (!exportSupportsVideo || !hasEditedResolutionMismatch) {
@@ -664,9 +651,9 @@ function App() {
 
     const engine = new TimelinePreviewEngine(canvas, {
       onTimeUpdate: (timeSec) => {
-        setEditedPositionSec((previous) => (nearlyEqual(previous, timeSec) ? previous : timeSec));
+        setPreviewPositionSec((previous) => (nearlyEqual(previous, timeSec) ? previous : timeSec));
 
-        const currentSegments = editedSegmentsRef.current;
+        const currentSegments = previewSegmentsRef.current;
         if (currentSegments.length === 0) {
           setCurrentSegmentIndex(0);
           return;
@@ -731,25 +718,25 @@ function App() {
 
   // Reposition playback when timeline structure changes.
   useEffect(() => {
-    if (editedSegments.length === 0) {
+    if (previewTimelineSegments.length === 0) {
       previewEngineRef.current?.pause();
       setCurrentSegmentIndex(0);
-      setEditedPositionSec(0);
+      setPreviewPositionSec(0);
       setIsPlaying(false);
       return;
     }
 
     const engine = previewEngineRef.current;
-    const upperBound = Math.max(0, editedDurationSec - 0.0001);
-    const currentPosition = engine?.getPositionSec() ?? editedPositionSec;
+    const upperBound = Math.max(0, previewDurationSec - 0.0001);
+    const currentPosition = engine?.getPositionSec() ?? previewPositionSec;
     const clampedPosition = clamp(currentPosition, 0, upperBound);
-    const nextSegmentIndex = Math.max(0, findSegmentIndex(editedSegments, clampedPosition));
+    const nextSegmentIndex = Math.max(0, findSegmentIndex(previewTimelineSegments, clampedPosition));
     engine?.pause();
     setIsPlaying(false);
-    setEditedPositionSec((previous) => (nearlyEqual(previous, clampedPosition) ? previous : clampedPosition));
+    setPreviewPositionSec((previous) => (nearlyEqual(previous, clampedPosition) ? previous : clampedPosition));
     setCurrentSegmentIndex((previous) => (previous === nextSegmentIndex ? previous : nextSegmentIndex));
     engine?.seek(clampedPosition);
-  }, [editedDurationSec, editedSegments]);
+  }, [previewDurationSec, previewTimelineSegments]);
 
   // Keep trim window visual coverage stable when timeline duration changes (e.g. speed edits).
   useEffect(() => {
@@ -880,6 +867,36 @@ function App() {
   }, [isBusy, isDraggingTrimEdge, timelineDurationSec]);
 
   useEffect(() => {
+    const handleWindowKeyDown = (event: KeyboardEvent): void => {
+      const isSpace =
+        event.code === "Space" || event.key === " " || event.key === "Spacebar";
+      if (!isSpace || event.defaultPrevented || event.repeat) {
+        return;
+      }
+
+      if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) {
+        return;
+      }
+
+      if (isKeyboardEventFromInteractiveElement(event.target)) {
+        return;
+      }
+
+      if (!previewEngineRef.current || previewSegmentsRef.current.length === 0) {
+        return;
+      }
+
+      event.preventDefault();
+      togglePlayPauseRef.current();
+    };
+
+    window.addEventListener("keydown", handleWindowKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleWindowKeyDown);
+    };
+  }, []);
+
+  useEffect(() => {
     if (!isDraggingPlayhead) {
       return;
     }
@@ -940,7 +957,7 @@ function App() {
     previewEngineRef.current?.seek(0);
     setTrimStartSec(0);
     setTrimEndSec(durationSec);
-    setEditedPositionSec(0);
+    setPreviewPositionSec(0);
     setCurrentSegmentIndex(0);
     setIsPlaying(false);
     setSelectedTimelineItemId(null);
@@ -1073,19 +1090,19 @@ function App() {
     }
   }
 
-  function seekToEditedPosition(targetSec: number, autoPlay: boolean): void {
-    if (editedSegments.length === 0) {
+  function seekToPreviewPosition(targetSec: number, autoPlay: boolean): void {
+    if (previewTimelineSegments.length === 0) {
       return;
     }
 
-    const upperBound = Math.max(0, editedDurationSec - 0.0001);
+    const upperBound = Math.max(0, previewDurationSec - 0.0001);
     const clamped = clamp(targetSec, 0, upperBound);
-    const nextIndex = findSegmentIndex(editedSegments, clamped);
+    const nextIndex = findSegmentIndex(previewTimelineSegments, clamped);
     if (nextIndex < 0) {
       return;
     }
 
-    setEditedPositionSec(clamped);
+    setPreviewPositionSec(clamped);
     setCurrentSegmentIndex(nextIndex);
 
     const engine = previewEngineRef.current;
@@ -1108,13 +1125,12 @@ function App() {
   }
 
   function seekToTimelinePosition(rawPositionSec: number, autoPlay: boolean): void {
-    if (editedSegments.length === 0) {
+    if (previewTimelineSegments.length === 0 || timelineDurationSec <= 0) {
       return;
     }
 
-    const boundedRaw = clamp(rawPositionSec, trimStartSec, trimEndSec);
-    const targetEdited = clamp(boundedRaw - trimStartSec, 0, editedDurationSec);
-    seekToEditedPosition(targetEdited, autoPlay);
+    const boundedRaw = clamp(rawPositionSec, 0, timelineDurationSec);
+    seekToPreviewPosition(boundedRaw, autoPlay);
   }
 
   function applyTrimStart(nextValueSec: number): void {
@@ -1145,13 +1161,14 @@ function App() {
 
   async function togglePlayPause(): Promise<void> {
     const engine = previewEngineRef.current;
-    if (!engine || editedSegments.length === 0) {
+    if (!engine || previewTimelineSegments.length === 0) {
       return;
     }
 
     if (!isPlaying) {
-      if (editedPositionSec >= editedDurationSec - SEGMENT_END_EPSILON) {
-        seekToEditedPosition(0, false);
+      const currentPosition = engine.getPositionSec();
+      if (currentPosition >= previewDurationSec - SEGMENT_END_EPSILON) {
+        seekToPreviewPosition(0, false);
       }
 
       try {
@@ -1165,6 +1182,9 @@ function App() {
     engine.pause();
     setIsPlaying(false);
   }
+  togglePlayPauseRef.current = () => {
+    void togglePlayPause();
+  };
 
   function splitTimelineAt(rawPositionSec: number): void {
     if (timelineDisplayItems.length === 0 || timelineDurationSec <= 0) {
@@ -1275,7 +1295,12 @@ function App() {
   }
 
   function handlePlayheadPointerDown(event: ReactPointerEvent<HTMLDivElement>): void {
-    if (event.button !== 0 || isBusy || timelineDurationSec <= 0 || editedSegments.length === 0) {
+    if (
+      event.button !== 0 ||
+      isBusy ||
+      timelineDurationSec <= 0 ||
+      previewTimelineSegments.length === 0
+    ) {
       return;
     }
 
@@ -1663,16 +1688,16 @@ function App() {
                 className="button primary"
                 type="button"
                 onClick={() => void togglePlayPause()}
-                disabled={editedSegments.length === 0}
+                disabled={previewTimelineSegments.length === 0}
               >
                 {isPlaying ? "Pause" : "Play"}
               </button>
 
               <p className="timeline-readout">
-                {formatDuration(editedPositionSec)} / {formatDuration(editedDurationSec)}
+                {formatDuration(previewPositionSec)} / {formatDuration(previewDurationSec)}
               </p>
               <p className="timeline-readout-sub">
-                Frame {currentEditedFrame.toLocaleString()} / {totalEditedFrames.toLocaleString()}
+                Frame {currentPreviewFrame.toLocaleString()} / {totalPreviewFrames.toLocaleString()}
                 {isFrameReadoutEstimated ? " (auto fps)" : ""}
               </p>
 
