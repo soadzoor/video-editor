@@ -206,7 +206,9 @@ body {
 }
 
 .preview-frame .preview-canvas {
-  width: 100%;
+  width: auto;
+  height: auto;
+  max-width: 100%;
   display: block;
   max-height: 480px;
   background: #000;
