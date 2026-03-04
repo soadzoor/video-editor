@@ -205,6 +205,12 @@ body {
   place-items: center;
 }
 
+.preview-surface {
+  position: relative;
+  display: inline-block;
+  line-height: 0;
+}
+
 .preview-frame .preview-canvas {
   width: auto;
   height: auto;
@@ -212,6 +218,119 @@ body {
   display: block;
   max-height: 480px;
   background: #000;
+}
+
+.crop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+}
+
+.crop-mask-pane {
+  position: absolute;
+  background: rgba(1, 7, 15, 0.55);
+  pointer-events: none;
+}
+
+.crop-overlay.has-pan .crop-mask-pane {
+  pointer-events: auto;
+  cursor: grab;
+}
+
+.crop-overlay.has-pan.panning .crop-mask-pane {
+  cursor: grabbing;
+}
+
+.crop-window {
+  position: absolute;
+  z-index: 2;
+  border: 1px solid rgba(153, 255, 212, 0.95);
+  background: rgba(127, 255, 210, 0.12);
+  cursor: move;
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.crop-overlay.dragging .crop-window {
+  border-color: rgba(189, 255, 233, 1);
+  box-shadow: 0 0 0 1px rgba(189, 255, 233, 0.75);
+}
+
+.crop-handle {
+  position: absolute;
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.crop-handle-edge {
+  background: rgba(189, 255, 233, 0.92);
+}
+
+.crop-handle-top,
+.crop-handle-bottom {
+  left: 0;
+  right: 0;
+  height: 8px;
+}
+
+.crop-handle-top {
+  top: -4px;
+  cursor: ns-resize;
+}
+
+.crop-handle-bottom {
+  bottom: -4px;
+  cursor: ns-resize;
+}
+
+.crop-handle-left,
+.crop-handle-right {
+  top: 0;
+  bottom: 0;
+  width: 8px;
+}
+
+.crop-handle-left {
+  left: -4px;
+  cursor: ew-resize;
+}
+
+.crop-handle-right {
+  right: -4px;
+  cursor: ew-resize;
+}
+
+.crop-handle-corner {
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(5, 17, 32, 0.9);
+  background: rgba(223, 255, 244, 0.98);
+}
+
+.crop-handle-top-left {
+  top: -6px;
+  left: -6px;
+  cursor: nwse-resize;
+}
+
+.crop-handle-top-right {
+  top: -6px;
+  right: -6px;
+  cursor: nesw-resize;
+}
+
+.crop-handle-bottom-left {
+  bottom: -6px;
+  left: -6px;
+  cursor: nesw-resize;
+}
+
+.crop-handle-bottom-right {
+  bottom: -6px;
+  right: -6px;
+  cursor: nwse-resize;
 }
 
 .preview-empty {
@@ -582,6 +701,48 @@ input[type="number"]::-webkit-inner-spin-button {
   flex-wrap: wrap;
 }
 
+.crop-controls {
+  margin-top: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 10px;
+  background: rgba(5, 11, 24, 0.35);
+  padding: 10px;
+  display: grid;
+  gap: 8px;
+}
+
+.crop-controls-title {
+  margin: 0;
+  font-size: 0.86rem;
+  font-weight: 700;
+  color: var(--text-main);
+}
+
+.crop-controls-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.crop-input-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.crop-input-grid label {
+  display: grid;
+  gap: 4px;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.preview-transform-panel {
+  margin-top: 2px;
+}
+
 .timeline-track-shell {
   position: relative;
   min-height: 44px;
@@ -921,5 +1082,9 @@ input[type="number"]::-webkit-inner-spin-button {
 
   .input-grid-4 {
     grid-template-columns: 1fr;
+  }
+
+  .crop-input-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }

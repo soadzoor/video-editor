@@ -22,6 +22,9 @@ export interface PreviewSegment {
   sourceStart: number;
   sourceEnd: number;
   speed: number;
+  scale: number;
+  panX: number;
+  panY: number;
   editedStart: number;
   editedEnd: number;
 }
@@ -86,6 +89,20 @@ function clamp(value: number, min: number, max: number): number {
 
 function nearlyEqual(a: number, b: number): boolean {
   return Math.abs(a - b) <= PREVIEW_EPSILON;
+}
+
+function clampPreviewScale(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 1;
+  }
+  return Math.min(1000, Math.max(0.001, value));
+}
+
+function sanitizePan(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  return value;
 }
 
 function findSegmentIndex(segments: PreviewSegment[], timeSec: number): number {
@@ -486,7 +503,8 @@ export class TimelinePreviewEngine {
   public async setProject(
     clips: PreviewClip[],
     segments: PreviewSegment[],
-    editedPositionSec: number
+    editedPositionSec: number,
+    workspaceResolution?: { width: number; height: number }
   ): Promise<void> {
     const clipIds = new Set(clips.map((clip) => clip.id));
 
@@ -518,7 +536,7 @@ export class TimelinePreviewEngine {
 
     this.segments = [...segments].sort((a, b) => a.editedStart - b.editedStart);
     this.durationSec = this.segments.length > 0 ? this.segments[this.segments.length - 1].editedEnd : 0;
-    this.updateCanvasResolution(clips);
+    this.updateCanvasResolution(clips, workspaceResolution);
 
     if (this.durationSec <= 0 || this.segments.length === 0) {
       this.pause();
@@ -650,23 +668,31 @@ export class TimelinePreviewEngine {
     this.callbacks.onTimeUpdate?.(bounded);
   }
 
-  private updateCanvasResolution(clips: PreviewClip[]): void {
-    if (clips.length === 0) {
-      this.canvas.width = 1280;
-      this.canvas.height = 720;
-      return;
-    }
-
-    let bestArea = 0;
+  private updateCanvasResolution(
+    clips: PreviewClip[],
+    workspaceResolution?: { width: number; height: number }
+  ): void {
     let width = 1280;
     let height = 720;
 
-    for (const clip of clips) {
-      const area = Math.max(1, clip.width) * Math.max(1, clip.height);
-      if (area > bestArea) {
-        bestArea = area;
-        width = Math.max(2, Math.round(clip.width));
-        height = Math.max(2, Math.round(clip.height));
+    if (
+      workspaceResolution &&
+      Number.isFinite(workspaceResolution.width) &&
+      Number.isFinite(workspaceResolution.height) &&
+      workspaceResolution.width >= 2 &&
+      workspaceResolution.height >= 2
+    ) {
+      width = Math.max(2, Math.round(workspaceResolution.width));
+      height = Math.max(2, Math.round(workspaceResolution.height));
+    } else if (clips.length > 0) {
+      let bestArea = 0;
+      for (const clip of clips) {
+        const area = Math.max(1, clip.width) * Math.max(1, clip.height);
+        if (area > bestArea) {
+          bestArea = area;
+          width = Math.max(2, Math.round(clip.width));
+          height = Math.max(2, Math.round(clip.height));
+        }
       }
     }
 
@@ -940,7 +966,12 @@ export class TimelinePreviewEngine {
     }
   }
 
-  private drawQueuedFrame(state: ClipRuntime, sourceTimeSec: number, isSeek: boolean): boolean {
+  private drawQueuedFrame(
+    state: ClipRuntime,
+    segment: PreviewSegment,
+    sourceTimeSec: number,
+    isSeek: boolean
+  ): boolean {
     if (state.frameQueue.length === 0) {
       return false;
     }
@@ -981,11 +1012,14 @@ export class TimelinePreviewEngine {
     this.ctx.fillRect(0, 0, canvasWidth, canvasHeight);
 
     if (frameWidth > 0 && frameHeight > 0) {
-      const scale = Math.min(canvasWidth / frameWidth, canvasHeight / frameHeight);
-      const drawWidth = frameWidth * scale;
-      const drawHeight = frameHeight * scale;
-      const x = (canvasWidth - drawWidth) / 2;
-      const y = (canvasHeight - drawHeight) / 2;
+      const containScale = Math.min(canvasWidth / frameWidth, canvasHeight / frameHeight);
+      const baseWidth = frameWidth * containScale;
+      const baseHeight = frameHeight * containScale;
+      const transformScale = clampPreviewScale(segment.scale);
+      const drawWidth = baseWidth * transformScale;
+      const drawHeight = baseHeight * transformScale;
+      const x = (canvasWidth - drawWidth) / 2 + sanitizePan(segment.panX);
+      const y = (canvasHeight - drawHeight) / 2 + sanitizePan(segment.panY);
       this.ctx.drawImage(frame, x, y, drawWidth, drawHeight);
     }
 
@@ -1053,7 +1087,7 @@ export class TimelinePreviewEngine {
         isSeek
       );
 
-      const drew = this.drawQueuedFrame(state, sourceTimeSec, isSeek);
+      const drew = this.drawQueuedFrame(state, segment, sourceTimeSec, isSeek);
       if (!drew) {
         this.paintBlackFrame();
       }

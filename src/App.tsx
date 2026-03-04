@@ -36,6 +36,9 @@ interface TimelineItem {
   sourceStart: number;
   sourceEnd: number;
   speed: number;
+  scale: number;
+  panX: number;
+  panY: number;
 }
 
 interface TimelineDisplayItem extends TimelineItem {
@@ -52,10 +55,62 @@ interface EditedSegment {
   sourceStart: number;
   sourceEnd: number;
   speed: number;
+  scale: number;
+  panX: number;
+  panY: number;
   timelineStart: number;
   timelineEnd: number;
   editedStart: number;
   editedEnd: number;
+}
+
+interface CropRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+type CropDragMode =
+  | "move"
+  | "left"
+  | "right"
+  | "top"
+  | "bottom"
+  | "top-left"
+  | "top-right"
+  | "bottom-left"
+  | "bottom-right";
+
+interface CropDragState {
+  pointerId: number;
+  mode: CropDragMode;
+  startClientX: number;
+  startClientY: number;
+  overlayLeftPx: number;
+  overlayTopPx: number;
+  overlayWidthPx: number;
+  overlayHeightPx: number;
+  workspaceWidth: number;
+  workspaceHeight: number;
+  startRect: CropRect;
+}
+
+interface PreviewPanDragState {
+  pointerId: number;
+  startClientX: number;
+  startClientY: number;
+  overlayWidthPx: number;
+  overlayHeightPx: number;
+  workspaceWidth: number;
+  workspaceHeight: number;
+  initialPanX: number;
+  initialPanY: number;
+  baseX: number;
+  baseY: number;
+  drawWidth: number;
+  drawHeight: number;
+  cropRect: CropRect;
 }
 
 interface TrimWindowDragState {
@@ -92,6 +147,12 @@ const MAX_SEGMENT_SPEED = 1000;
 const MIN_SEGMENT_SPEED_LOG = Math.log10(MIN_SEGMENT_SPEED);
 const MAX_SEGMENT_SPEED_LOG = Math.log10(MAX_SEGMENT_SPEED);
 const TRIM_SNAP_STEP_SEC = 0.001;
+const MIN_CROP_SIZE_PX = 2;
+const PAN_SNAP_THRESHOLD_PX = 12;
+const MIN_PIECE_SCALE = 0.001;
+const MAX_PIECE_SCALE = 1000;
+const MIN_PIECE_SCALE_LOG = Math.log10(MIN_PIECE_SCALE);
+const MAX_PIECE_SCALE_LOG = Math.log10(MAX_PIECE_SCALE);
 
 function makeId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -159,6 +220,32 @@ function formatSpeedLabel(speed: number): string {
   return Number(clampSpeed(speed).toPrecision(6)).toString();
 }
 
+function clampPieceScale(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 1;
+  }
+  return clamp(value, MIN_PIECE_SCALE, MAX_PIECE_SCALE);
+}
+
+function scaleToLogSliderValue(scale: number): number {
+  return clamp(Math.log10(clampPieceScale(scale)), MIN_PIECE_SCALE_LOG, MAX_PIECE_SCALE_LOG);
+}
+
+function logSliderValueToScale(value: number): number {
+  return clampPieceScale(10 ** clamp(value, MIN_PIECE_SCALE_LOG, MAX_PIECE_SCALE_LOG));
+}
+
+function formatScaleLabel(scale: number): string {
+  return Number(clampPieceScale(scale).toPrecision(6)).toString();
+}
+
+function normalizePanValue(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  return Math.round(value * 1000) / 1000;
+}
+
 function parsePositiveIntegerInput(value: string): number | null {
   if (!/^\d+$/.test(value)) {
     return null;
@@ -175,6 +262,48 @@ function normalizeTimeValue(value: number): number {
     return 0;
   }
   return Math.round(value * 1_000_000) / 1_000_000;
+}
+
+function normalizeCropRect(rect: CropRect, workspaceWidth: number, workspaceHeight: number): CropRect {
+  const maxWidth = Math.max(MIN_CROP_SIZE_PX, Math.round(workspaceWidth));
+  const maxHeight = Math.max(MIN_CROP_SIZE_PX, Math.round(workspaceHeight));
+  const width = clamp(Math.round(rect.width), MIN_CROP_SIZE_PX, maxWidth);
+  const height = clamp(Math.round(rect.height), MIN_CROP_SIZE_PX, maxHeight);
+  const x = clamp(Math.round(rect.x), 0, Math.max(0, maxWidth - width));
+  const y = clamp(Math.round(rect.y), 0, Math.max(0, maxHeight - height));
+  return { x, y, width, height };
+}
+
+function snapAxisToNearestEdge(rawValue: number, edgeA: number, edgeB: number, thresholdPx: number): number {
+  const distA = Math.abs(rawValue - edgeA);
+  const distB = Math.abs(rawValue - edgeB);
+  const nearest = distA <= distB ? edgeA : edgeB;
+  return Math.abs(rawValue - nearest) <= thresholdPx ? nearest : rawValue;
+}
+
+function snapPanToCropEdges(
+  rawPanX: number,
+  rawPanY: number,
+  baseX: number,
+  baseY: number,
+  drawWidth: number,
+  drawHeight: number,
+  cropRect: CropRect
+): { panX: number; panY: number } {
+  const cropLeft = cropRect.x;
+  const cropRight = cropRect.x + cropRect.width;
+  const cropTop = cropRect.y;
+  const cropBottom = cropRect.y + cropRect.height;
+
+  const targetPanXLeft = cropLeft - baseX;
+  const targetPanXRight = cropRight - (baseX + drawWidth);
+  const targetPanYTop = cropTop - baseY;
+  const targetPanYBottom = cropBottom - (baseY + drawHeight);
+
+  return {
+    panX: snapAxisToNearestEdge(rawPanX, targetPanXLeft, targetPanXRight, PAN_SNAP_THRESHOLD_PX),
+    panY: snapAxisToNearestEdge(rawPanY, targetPanYTop, targetPanYBottom, PAN_SNAP_THRESHOLD_PX)
+  };
 }
 
 function exportStageLabel(stage: ExportStage): string {
@@ -298,6 +427,9 @@ function buildEditedSegments(
       sourceStart,
       sourceEnd,
       speed: item.speed,
+      scale: item.scale,
+      panX: item.panX,
+      panY: item.panY,
       timelineStart: overlapStart,
       timelineEnd: overlapEnd,
       editedStart: editedOffset,
@@ -367,6 +499,191 @@ function isKeyboardEventFromInteractiveElement(target: EventTarget | null): bool
   );
 }
 
+function convertClientToWorkspace(
+  clientX: number,
+  clientY: number,
+  drag: CropDragState
+): { x: number; y: number } {
+  const ratioX =
+    drag.overlayWidthPx <= 0 ? 0 : clamp((clientX - drag.overlayLeftPx) / drag.overlayWidthPx, 0, 1);
+  const ratioY =
+    drag.overlayHeightPx <= 0 ? 0 : clamp((clientY - drag.overlayTopPx) / drag.overlayHeightPx, 0, 1);
+  return {
+    x: ratioX * drag.workspaceWidth,
+    y: ratioY * drag.workspaceHeight
+  };
+}
+
+function applyCropDrag(
+  drag: CropDragState,
+  clientX: number,
+  clientY: number,
+  lockAspect: boolean,
+  aspectRatio: number
+): CropRect {
+  const { x: pointerX, y: pointerY } = convertClientToWorkspace(clientX, clientY, drag);
+  const { x, y, width, height } = drag.startRect;
+  const startLeft = x;
+  const startTop = y;
+  const startRight = x + width;
+  const startBottom = y + height;
+  const dx = ((clientX - drag.startClientX) / Math.max(1, drag.overlayWidthPx)) * drag.workspaceWidth;
+  const dy = ((clientY - drag.startClientY) / Math.max(1, drag.overlayHeightPx)) * drag.workspaceHeight;
+
+  let left = startLeft;
+  let right = startRight;
+  let top = startTop;
+  let bottom = startBottom;
+
+  if (drag.mode === "move") {
+    const nextLeft = clamp(startLeft + dx, 0, Math.max(0, drag.workspaceWidth - width));
+    const nextTop = clamp(startTop + dy, 0, Math.max(0, drag.workspaceHeight - height));
+    return normalizeCropRect(
+      {
+        x: nextLeft,
+        y: nextTop,
+        width,
+        height
+      },
+      drag.workspaceWidth,
+      drag.workspaceHeight
+    );
+  }
+
+  if (drag.mode.includes("left")) {
+    left = clamp(pointerX, 0, right - MIN_CROP_SIZE_PX);
+  }
+  if (drag.mode.includes("right")) {
+    right = clamp(pointerX, left + MIN_CROP_SIZE_PX, drag.workspaceWidth);
+  }
+  if (drag.mode.includes("top")) {
+    top = clamp(pointerY, 0, bottom - MIN_CROP_SIZE_PX);
+  }
+  if (drag.mode.includes("bottom")) {
+    bottom = clamp(pointerY, top + MIN_CROP_SIZE_PX, drag.workspaceHeight);
+  }
+
+  if (!lockAspect || !Number.isFinite(aspectRatio) || aspectRatio <= 0) {
+    return normalizeCropRect(
+      { x: left, y: top, width: right - left, height: bottom - top },
+      drag.workspaceWidth,
+      drag.workspaceHeight
+    );
+  }
+
+  const ratio = aspectRatio;
+  const centerX = (startLeft + startRight) / 2;
+  const centerY = (startTop + startBottom) / 2;
+
+  if (drag.mode === "left" || drag.mode === "right") {
+    const fixedX = drag.mode === "left" ? startRight : startLeft;
+    let nextWidth = Math.abs(fixedX - (drag.mode === "left" ? left : right));
+    const maxByBounds = drag.mode === "left" ? fixedX : drag.workspaceWidth - fixedX;
+    nextWidth = clamp(nextWidth, MIN_CROP_SIZE_PX, Math.max(MIN_CROP_SIZE_PX, maxByBounds));
+    let nextHeight = nextWidth / ratio;
+    const maxHalfHeight = Math.min(centerY, drag.workspaceHeight - centerY);
+    if (nextHeight / 2 > maxHalfHeight) {
+      nextHeight = maxHalfHeight * 2;
+      nextWidth = nextHeight * ratio;
+    }
+    left = drag.mode === "left" ? fixedX - nextWidth : fixedX;
+    right = drag.mode === "left" ? fixedX : fixedX + nextWidth;
+    top = centerY - nextHeight / 2;
+    bottom = centerY + nextHeight / 2;
+  } else if (drag.mode === "top" || drag.mode === "bottom") {
+    const fixedY = drag.mode === "top" ? startBottom : startTop;
+    let nextHeight = Math.abs(fixedY - (drag.mode === "top" ? top : bottom));
+    const maxByBounds = drag.mode === "top" ? fixedY : drag.workspaceHeight - fixedY;
+    nextHeight = clamp(nextHeight, MIN_CROP_SIZE_PX, Math.max(MIN_CROP_SIZE_PX, maxByBounds));
+    let nextWidth = nextHeight * ratio;
+    const maxHalfWidth = Math.min(centerX, drag.workspaceWidth - centerX);
+    if (nextWidth / 2 > maxHalfWidth) {
+      nextWidth = maxHalfWidth * 2;
+      nextHeight = nextWidth / ratio;
+    }
+    top = drag.mode === "top" ? fixedY - nextHeight : fixedY;
+    bottom = drag.mode === "top" ? fixedY : fixedY + nextHeight;
+    left = centerX - nextWidth / 2;
+    right = centerX + nextWidth / 2;
+  } else {
+    let anchorX = startLeft;
+    let anchorY = startTop;
+    let widthFromX = right - left;
+    let heightFromY = bottom - top;
+
+    if (drag.mode === "top-left") {
+      anchorX = startRight;
+      anchorY = startBottom;
+      widthFromX = anchorX - left;
+      heightFromY = anchorY - top;
+    } else if (drag.mode === "top-right") {
+      anchorX = startLeft;
+      anchorY = startBottom;
+      widthFromX = right - anchorX;
+      heightFromY = anchorY - top;
+    } else if (drag.mode === "bottom-left") {
+      anchorX = startRight;
+      anchorY = startTop;
+      widthFromX = anchorX - left;
+      heightFromY = bottom - anchorY;
+    } else if (drag.mode === "bottom-right") {
+      anchorX = startLeft;
+      anchorY = startTop;
+      widthFromX = right - anchorX;
+      heightFromY = bottom - anchorY;
+    }
+
+    const widthViaHeight = heightFromY * ratio;
+    let nextWidth = Math.min(widthFromX, widthViaHeight);
+    if (!Number.isFinite(nextWidth) || nextWidth <= 0) {
+      nextWidth = widthFromX;
+    }
+    nextWidth = Math.max(MIN_CROP_SIZE_PX, nextWidth);
+    let nextHeight = nextWidth / ratio;
+
+    const maxWidth =
+      drag.mode.includes("left") ? anchorX : drag.workspaceWidth - anchorX;
+    const maxHeight =
+      drag.mode.includes("top") ? anchorY : drag.workspaceHeight - anchorY;
+    if (nextWidth > maxWidth) {
+      nextWidth = maxWidth;
+      nextHeight = nextWidth / ratio;
+    }
+    if (nextHeight > maxHeight) {
+      nextHeight = maxHeight;
+      nextWidth = nextHeight * ratio;
+    }
+
+    if (drag.mode === "top-left") {
+      left = anchorX - nextWidth;
+      right = anchorX;
+      top = anchorY - nextHeight;
+      bottom = anchorY;
+    } else if (drag.mode === "top-right") {
+      left = anchorX;
+      right = anchorX + nextWidth;
+      top = anchorY - nextHeight;
+      bottom = anchorY;
+    } else if (drag.mode === "bottom-left") {
+      left = anchorX - nextWidth;
+      right = anchorX;
+      top = anchorY;
+      bottom = anchorY + nextHeight;
+    } else {
+      left = anchorX;
+      right = anchorX + nextWidth;
+      top = anchorY;
+      bottom = anchorY + nextHeight;
+    }
+  }
+
+  return normalizeCropRect(
+    { x: left, y: top, width: right - left, height: bottom - top },
+    drag.workspaceWidth,
+    drag.workspaceHeight
+  );
+}
+
 function App() {
   const [clips, setClips] = useState<SourceClip[]>([]);
   const [timelineItems, setTimelineItems] = useState<TimelineItem[]>([]);
@@ -411,16 +728,34 @@ function App() {
   const [activeTrimEdge, setActiveTrimEdge] = useState<"start" | "end" | null>(null);
   const [isDraggingPlayhead, setIsDraggingPlayhead] = useState(false);
   const [selectedSpeedInput, setSelectedSpeedInput] = useState("");
+  const [selectedScaleInput, setSelectedScaleInput] = useState("");
+  const [selectedPanXInput, setSelectedPanXInput] = useState("");
+  const [selectedPanYInput, setSelectedPanYInput] = useState("");
+  const [cropEnabled, setCropEnabled] = useState(false);
+  const [cropLockAspect, setCropLockAspect] = useState(true);
+  const [cropAspectRatio, setCropAspectRatio] = useState(16 / 9);
+  const [cropRect, setCropRect] = useState<CropRect>({
+    x: 0,
+    y: 0,
+    width: 1280,
+    height: 720
+  });
+  const [isDraggingCrop, setIsDraggingCrop] = useState(false);
+  const [isDraggingPreviewPan, setIsDraggingPreviewPan] = useState(false);
   const [isPreviewSupported] = useState(
     () => typeof window !== "undefined" && "VideoDecoder" in window && "EncodedVideoChunk" in window
   );
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const previewCanvasRef = useRef<HTMLCanvasElement>(null);
+  const previewSurfaceRef = useRef<HTMLDivElement>(null);
   const previewEngineRef = useRef<TimelinePreviewEngine | null>(null);
   const previewSegmentsRef = useRef<EditedSegment[]>([]);
   const clipsRef = useRef<SourceClip[]>([]);
   const togglePlayPauseRef = useRef<() => void>(() => undefined);
+  const cropDragRef = useRef<CropDragState | null>(null);
+  const previewPanDragRef = useRef<PreviewPanDragState | null>(null);
+  const previousWorkspaceSizeRef = useRef<{ width: number; height: number } | null>(null);
 
   const trimRangeShellRef = useRef<HTMLDivElement>(null);
   const trimWindowDragRef = useRef<TrimWindowDragState | null>(null);
@@ -487,6 +822,40 @@ function App() {
 
     return false;
   }, [clipById, editedSegments]);
+  const requestedWorkspaceWidth = useMemo(() => {
+    const value = exportWidthInput.trim();
+    if (value === "") {
+      return null;
+    }
+    const parsed = parsePositiveIntegerInput(value);
+    if (!parsed || parsed < 2) {
+      return null;
+    }
+    return parsed;
+  }, [exportWidthInput]);
+  const requestedWorkspaceHeight = useMemo(() => {
+    const value = exportHeightInput.trim();
+    if (value === "") {
+      return null;
+    }
+    const parsed = parsePositiveIntegerInput(value);
+    if (!parsed || parsed < 2) {
+      return null;
+    }
+    return parsed;
+  }, [exportHeightInput]);
+  const hasCustomWorkspace =
+    requestedWorkspaceWidth !== null && requestedWorkspaceHeight !== null;
+  const workspaceWidth = hasCustomWorkspace
+    ? requestedWorkspaceWidth
+    : largestClipResolution.width > 0
+      ? largestClipResolution.width
+      : 1280;
+  const workspaceHeight = hasCustomWorkspace
+    ? requestedWorkspaceHeight
+    : largestClipResolution.height > 0
+      ? largestClipResolution.height
+      : 720;
   const requestedExportFps = useMemo(() => {
     const value = exportFpsInput.trim();
     if (value === "") {
@@ -545,6 +914,9 @@ function App() {
   const selectedSpeedSliderValue = selectedTimelineItem
     ? speedToLogSliderValue(selectedTimelineItem.speed)
     : 0;
+  const selectedScaleSliderValue = selectedTimelineItem
+    ? scaleToLogSliderValue(selectedTimelineItem.scale)
+    : 0;
 
   const isBusy = isIngesting || isExporting;
   const disableVideoToggle = isBusy || !exportSupportsVideo || !exportSupportsAudio;
@@ -595,11 +967,37 @@ function App() {
         sourceStart: segment.sourceStart,
         sourceEnd: segment.sourceEnd,
         speed: segment.speed,
+        scale:
+          selectedTimelineItemId !== null && segment.timelineItemId === selectedTimelineItemId
+            ? segment.scale
+            : 1,
+        panX:
+          selectedTimelineItemId !== null && segment.timelineItemId === selectedTimelineItemId
+            ? segment.panX
+            : 0,
+        panY:
+          selectedTimelineItemId !== null && segment.timelineItemId === selectedTimelineItemId
+            ? segment.panY
+            : 0,
         editedStart: segment.editedStart,
         editedEnd: segment.editedEnd
       })),
-    [previewTimelineSegments]
+    [previewTimelineSegments, selectedTimelineItemId]
   );
+  const normalizedCropRect = useMemo(
+    () => normalizeCropRect(cropRect, workspaceWidth, workspaceHeight),
+    [cropRect, workspaceWidth, workspaceHeight]
+  );
+  const cropRectPercent = {
+    left: workspaceWidth > 0 ? (normalizedCropRect.x / workspaceWidth) * 100 : 0,
+    top: workspaceHeight > 0 ? (normalizedCropRect.y / workspaceHeight) * 100 : 0,
+    width: workspaceWidth > 0 ? (normalizedCropRect.width / workspaceWidth) * 100 : 100,
+    height: workspaceHeight > 0 ? (normalizedCropRect.height / workspaceHeight) * 100 : 100
+  };
+  const cropMaskPercent = {
+    right: Math.max(0, 100 - cropRectPercent.left - cropRectPercent.width),
+    bottom: Math.max(0, 100 - cropRectPercent.top - cropRectPercent.height)
+  };
 
   useEffect(() => {
     clipsRef.current = clips;
@@ -616,6 +1014,52 @@ function App() {
   useEffect(() => {
     previewSegmentsRef.current = previewTimelineSegments;
   }, [previewTimelineSegments]);
+
+  useEffect(() => {
+    setCropRect((previous) => {
+      const previousWorkspace = previousWorkspaceSizeRef.current;
+      if (!previousWorkspace || previousWorkspace.width <= 0 || previousWorkspace.height <= 0) {
+        return normalizeCropRect(
+          {
+            x: 0,
+            y: 0,
+            width: workspaceWidth,
+            height: workspaceHeight
+          },
+          workspaceWidth,
+          workspaceHeight
+        );
+      }
+
+      if (
+        previousWorkspace.width === workspaceWidth &&
+        previousWorkspace.height === workspaceHeight
+      ) {
+        return normalizeCropRect(previous, workspaceWidth, workspaceHeight);
+      }
+
+      const next = {
+        x: Math.round((previous.x / previousWorkspace.width) * workspaceWidth),
+        y: Math.round((previous.y / previousWorkspace.height) * workspaceHeight),
+        width: Math.round((previous.width / previousWorkspace.width) * workspaceWidth),
+        height: Math.round((previous.height / previousWorkspace.height) * workspaceHeight)
+      };
+      return normalizeCropRect(next, workspaceWidth, workspaceHeight);
+    });
+
+    previousWorkspaceSizeRef.current = {
+      width: workspaceWidth,
+      height: workspaceHeight
+    };
+  }, [workspaceWidth, workspaceHeight]);
+
+  useEffect(() => {
+    if (!cropLockAspect || normalizedCropRect.height <= 0) {
+      return;
+    }
+    const nextRatio = normalizedCropRect.width / normalizedCropRect.height;
+    setCropAspectRatio((previous) => (nearlyEqual(previous, nextRatio) ? previous : nextRatio));
+  }, [cropLockAspect, normalizedCropRect.height, normalizedCropRect.width]);
 
   useEffect(() => {
     if (!exportSupportsVideo || !hasEditedResolutionMismatch) {
@@ -693,8 +1137,11 @@ function App() {
     }
 
     const currentPosition = engine.getPositionSec();
-    void engine.setProject(previewClips, previewSegments, currentPosition);
-  }, [isPreviewSupported, previewClips, previewSegments]);
+    void engine.setProject(previewClips, previewSegments, currentPosition, {
+      width: workspaceWidth,
+      height: workspaceHeight
+    });
+  }, [isPreviewSupported, previewClips, previewSegments, workspaceHeight, workspaceWidth]);
 
   useEffect(() => {
     if (selectedTimelineItemId && !timelineItems.some((item) => item.id === selectedTimelineItemId)) {
@@ -711,10 +1158,22 @@ function App() {
   useEffect(() => {
     if (!selectedTimelineItem) {
       setSelectedSpeedInput("");
+      setSelectedScaleInput("");
+      setSelectedPanXInput("");
+      setSelectedPanYInput("");
       return;
     }
     setSelectedSpeedInput(formatSpeedLabel(selectedTimelineItem.speed));
-  }, [selectedTimelineItemId, selectedTimelineItem?.speed]);
+    setSelectedScaleInput(formatScaleLabel(selectedTimelineItem.scale));
+    setSelectedPanXInput(normalizePanValue(selectedTimelineItem.panX).toString());
+    setSelectedPanYInput(normalizePanValue(selectedTimelineItem.panY).toString());
+  }, [
+    selectedTimelineItemId,
+    selectedTimelineItem?.speed,
+    selectedTimelineItem?.scale,
+    selectedTimelineItem?.panX,
+    selectedTimelineItem?.panY
+  ]);
 
   // Reposition playback when timeline structure changes.
   useEffect(() => {
@@ -951,6 +1410,140 @@ function App() {
     }
   }, [isBusy, isDraggingPlayhead, timelineDurationSec]);
 
+  useEffect(() => {
+    if (!isDraggingCrop) {
+      return;
+    }
+
+    const handlePointerMove = (event: PointerEvent): void => {
+      const drag = cropDragRef.current;
+      if (!drag || event.pointerId !== drag.pointerId) {
+        return;
+      }
+      event.preventDefault();
+      const nextRect = applyCropDrag(
+        drag,
+        event.clientX,
+        event.clientY,
+        cropLockAspect,
+        cropAspectRatio
+      );
+      setCropRect((previous) => {
+        if (
+          previous.x === nextRect.x &&
+          previous.y === nextRect.y &&
+          previous.width === nextRect.width &&
+          previous.height === nextRect.height
+        ) {
+          return previous;
+        }
+        return nextRect;
+      });
+    };
+
+    const stopDragging = (event?: PointerEvent): void => {
+      const drag = cropDragRef.current;
+      if (!drag) {
+        return;
+      }
+      if (event && event.pointerId !== drag.pointerId) {
+        return;
+      }
+      cropDragRef.current = null;
+      setIsDraggingCrop(false);
+    };
+
+    window.addEventListener("pointermove", handlePointerMove, { passive: false });
+    window.addEventListener("pointerup", stopDragging);
+    window.addEventListener("pointercancel", stopDragging);
+
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", stopDragging);
+      window.removeEventListener("pointercancel", stopDragging);
+    };
+  }, [cropAspectRatio, cropLockAspect, isDraggingCrop]);
+
+  useEffect(() => {
+    if (!isDraggingCrop) {
+      return;
+    }
+
+    if (isBusy || !cropEnabled || clips.length === 0) {
+      cropDragRef.current = null;
+      setIsDraggingCrop(false);
+    }
+  }, [clips.length, cropEnabled, isBusy, isDraggingCrop]);
+
+  useEffect(() => {
+    if (!isDraggingPreviewPan) {
+      return;
+    }
+
+    const handlePointerMove = (event: PointerEvent): void => {
+      const drag = previewPanDragRef.current;
+      if (!drag || event.pointerId !== drag.pointerId) {
+        return;
+      }
+
+      event.preventDefault();
+      const deltaX =
+        ((event.clientX - drag.startClientX) / Math.max(1, drag.overlayWidthPx)) * drag.workspaceWidth;
+      const deltaY =
+        ((event.clientY - drag.startClientY) / Math.max(1, drag.overlayHeightPx)) * drag.workspaceHeight;
+      const rawPanX = drag.initialPanX + deltaX;
+      const rawPanY = drag.initialPanY + deltaY;
+      const snapped = event.shiftKey
+        ? { panX: rawPanX, panY: rawPanY }
+        : snapPanToCropEdges(
+            rawPanX,
+            rawPanY,
+            drag.baseX,
+            drag.baseY,
+            drag.drawWidth,
+            drag.drawHeight,
+            drag.cropRect
+          );
+      setSelectedTimelineTransform({
+        panX: snapped.panX,
+        panY: snapped.panY
+      });
+    };
+
+    const stopDragging = (event?: PointerEvent): void => {
+      const drag = previewPanDragRef.current;
+      if (!drag) {
+        return;
+      }
+      if (event && event.pointerId !== drag.pointerId) {
+        return;
+      }
+      previewPanDragRef.current = null;
+      setIsDraggingPreviewPan(false);
+    };
+
+    window.addEventListener("pointermove", handlePointerMove, { passive: false });
+    window.addEventListener("pointerup", stopDragging);
+    window.addEventListener("pointercancel", stopDragging);
+
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", stopDragging);
+      window.removeEventListener("pointercancel", stopDragging);
+    };
+  }, [isDraggingPreviewPan]);
+
+  useEffect(() => {
+    if (!isDraggingPreviewPan) {
+      return;
+    }
+
+    if (isBusy || !cropEnabled || !selectedTimelineItem || clips.length === 0) {
+      previewPanDragRef.current = null;
+      setIsDraggingPreviewPan(false);
+    }
+  }, [clips.length, cropEnabled, isBusy, isDraggingPreviewPan, selectedTimelineItem]);
+
   function resetTimelineWindow(durationSec: number): void {
     skipTrimRescaleRef.current = true;
     previewEngineRef.current?.pause();
@@ -1006,7 +1599,10 @@ function App() {
         sourceClipId: clip.id,
         sourceStart: 0,
         sourceEnd: clip.duration,
-        speed: 1
+        speed: 1,
+        scale: 1,
+        panX: 0,
+        panY: 0
       }));
 
       const combinedClips = [...clips, ...nextClips];
@@ -1085,6 +1681,14 @@ function App() {
     setExportStage(null);
     setExportStatusMessage(null);
     setDraggingTimelineItemId(null);
+    setCropEnabled(false);
+    setCropRect({
+      x: 0,
+      y: 0,
+      width: 1280,
+      height: 720
+    });
+    previousWorkspaceSizeRef.current = null;
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
@@ -1218,14 +1822,20 @@ function App() {
         sourceClipId: target.sourceClipId,
         sourceStart: target.sourceStart,
         sourceEnd: splitSource,
-        speed: target.speed
+        speed: target.speed,
+        scale: target.scale,
+        panX: target.panX,
+        panY: target.panY
       };
       const rightPiece: TimelineItem = {
         id: rightId,
         sourceClipId: target.sourceClipId,
         sourceStart: splitSource,
         sourceEnd: target.sourceEnd,
-        speed: target.speed
+        speed: target.speed,
+        scale: target.scale,
+        panX: target.panX,
+        panY: target.panY
       };
 
       return [
@@ -1405,6 +2015,38 @@ function App() {
     setError(null);
   }
 
+  function setSelectedTimelineTransform(next: {
+    scale?: number;
+    panX?: number;
+    panY?: number;
+  }): void {
+    if (!selectedTimelineItemId || isBusy) {
+      return;
+    }
+
+    setTimelineItems((previous) =>
+      previous.map((item) =>
+        item.id === selectedTimelineItemId
+          ? (() => {
+              const nextScale =
+                next.scale === undefined ? clampPieceScale(item.scale) : clampPieceScale(next.scale);
+              const rawPanX =
+                next.panX === undefined ? item.panX : normalizePanValue(next.panX);
+              const rawPanY =
+                next.panY === undefined ? item.panY : normalizePanValue(next.panY);
+              return {
+                ...item,
+                scale: nextScale,
+                panX: rawPanX,
+                panY: rawPanY
+              };
+            })()
+          : item
+      )
+    );
+    setError(null);
+  }
+
   function handleSelectedSpeedInputChange(value: string): void {
     setSelectedSpeedInput(value);
     const parsed = Number(value);
@@ -1428,6 +2070,249 @@ function App() {
     setSelectedSpeedInput(formatSpeedLabel(clampedSpeed));
   }
 
+  function handleSelectedScaleInputChange(value: string): void {
+    setSelectedScaleInput(value);
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      return;
+    }
+    setSelectedTimelineTransform({ scale: parsed });
+  }
+
+  function commitSelectedScaleInput(): void {
+    if (!selectedTimelineItem) {
+      return;
+    }
+
+    const parsed = Number(selectedScaleInput);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      const fallback = clampPieceScale(selectedTimelineItem.scale);
+      setSelectedScaleInput(formatScaleLabel(fallback));
+      return;
+    }
+
+    const clampedValue = clampPieceScale(parsed);
+    setSelectedTimelineTransform({ scale: clampedValue });
+    setSelectedScaleInput(formatScaleLabel(clampedValue));
+  }
+
+  function handleSelectedPanInputChange(axis: "x" | "y", value: string): void {
+    if (axis === "x") {
+      setSelectedPanXInput(value);
+    } else {
+      setSelectedPanYInput(value);
+    }
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+      return;
+    }
+    setSelectedTimelineTransform(axis === "x" ? { panX: parsed } : { panY: parsed });
+  }
+
+  function commitSelectedPanInput(axis: "x" | "y"): void {
+    if (!selectedTimelineItem) {
+      return;
+    }
+
+    const raw = axis === "x" ? selectedPanXInput : selectedPanYInput;
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) {
+      if (axis === "x") {
+        setSelectedPanXInput(normalizePanValue(selectedTimelineItem.panX).toString());
+      } else {
+        setSelectedPanYInput(normalizePanValue(selectedTimelineItem.panY).toString());
+      }
+      return;
+    }
+
+    const normalized = normalizePanValue(parsed);
+    setSelectedTimelineTransform(axis === "x" ? { panX: normalized } : { panY: normalized });
+    if (axis === "x") {
+      setSelectedPanXInput(normalized.toString());
+    } else {
+      setSelectedPanYInput(normalized.toString());
+    }
+  }
+
+  function resetSelectedTransform(): void {
+    setSelectedTimelineTransform({ scale: 1, panX: 0, panY: 0 });
+  }
+
+  function fillSelectedPieceToCrop(): void {
+    if (!selectedTimelineItem) {
+      return;
+    }
+    const clip = clipById.get(selectedTimelineItem.sourceClipId);
+    if (!clip || clip.width <= 0 || clip.height <= 0) {
+      return;
+    }
+
+    const baseContainScale = Math.min(workspaceWidth / clip.width, workspaceHeight / clip.height);
+    if (!Number.isFinite(baseContainScale) || baseContainScale <= 0) {
+      return;
+    }
+    const baseWidth = clip.width * baseContainScale;
+    const baseHeight = clip.height * baseContainScale;
+    const targetRect = normalizedCropRect;
+    const fillScale = Math.max(targetRect.width / baseWidth, targetRect.height / baseHeight);
+    const cropCenterX = targetRect.x + targetRect.width / 2;
+    const cropCenterY = targetRect.y + targetRect.height / 2;
+    setSelectedTimelineTransform({
+      scale: clampPieceScale(fillScale),
+      panX: cropCenterX - workspaceWidth / 2,
+      panY: cropCenterY - workspaceHeight / 2
+    });
+  }
+
+  function applyCropRect(nextRect: CropRect): void {
+    setCropRect(normalizeCropRect(nextRect, workspaceWidth, workspaceHeight));
+  }
+
+  function setCropField(
+    field: "x" | "y" | "width" | "height",
+    value: string
+  ): void {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+      return;
+    }
+
+    const rounded = Math.round(parsed);
+    const current = normalizedCropRect;
+    let next: CropRect = { ...current, [field]: rounded };
+
+    if (cropLockAspect && (field === "width" || field === "height")) {
+      const ratio = cropAspectRatio > 0 ? cropAspectRatio : current.width / Math.max(1, current.height);
+      if (field === "width") {
+        next = {
+          ...next,
+          width: rounded,
+          height: Math.max(MIN_CROP_SIZE_PX, Math.round(rounded / ratio))
+        };
+      } else {
+        next = {
+          ...next,
+          height: rounded,
+          width: Math.max(MIN_CROP_SIZE_PX, Math.round(rounded * ratio))
+        };
+      }
+    }
+
+    applyCropRect(next);
+  }
+
+  function resetCropRect(): void {
+    applyCropRect({
+      x: 0,
+      y: 0,
+      width: workspaceWidth,
+      height: workspaceHeight
+    });
+  }
+
+  function handleCropPointerDown(
+    event: ReactPointerEvent<HTMLElement>,
+    mode: CropDragMode
+  ): void {
+    if (
+      event.button !== 0 ||
+      isBusy ||
+      !cropEnabled ||
+      clips.length === 0 ||
+      workspaceWidth <= 0 ||
+      workspaceHeight <= 0
+    ) {
+      return;
+    }
+
+    const surface = previewSurfaceRef.current;
+    if (!surface) {
+      return;
+    }
+    const rect = surface.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    cropDragRef.current = {
+      pointerId: event.pointerId,
+      mode,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+      overlayLeftPx: rect.left,
+      overlayTopPx: rect.top,
+      overlayWidthPx: rect.width,
+      overlayHeightPx: rect.height,
+      workspaceWidth,
+      workspaceHeight,
+      startRect: normalizedCropRect
+    };
+    setIsDraggingCrop(true);
+  }
+
+  function handlePreviewPanPointerDown(event: ReactPointerEvent<HTMLDivElement>): void {
+    if (
+      event.button !== 0 ||
+      isBusy ||
+      !cropEnabled ||
+      !selectedTimelineItem ||
+      clips.length === 0 ||
+      workspaceWidth <= 0 ||
+      workspaceHeight <= 0
+    ) {
+      return;
+    }
+
+    const surface = previewSurfaceRef.current;
+    if (!surface) {
+      return;
+    }
+
+    const rect = surface.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      return;
+    }
+
+    const selectedClip = clipById.get(selectedTimelineItem.sourceClipId);
+    if (!selectedClip || selectedClip.width <= 0 || selectedClip.height <= 0) {
+      return;
+    }
+
+    const containScale = Math.min(
+      workspaceWidth / selectedClip.width,
+      workspaceHeight / selectedClip.height
+    );
+    if (!Number.isFinite(containScale) || containScale <= 0) {
+      return;
+    }
+    const drawWidth = selectedClip.width * containScale * clampPieceScale(selectedTimelineItem.scale);
+    const drawHeight = selectedClip.height * containScale * clampPieceScale(selectedTimelineItem.scale);
+    const baseX = (workspaceWidth - drawWidth) / 2;
+    const baseY = (workspaceHeight - drawHeight) / 2;
+
+    event.preventDefault();
+    event.stopPropagation();
+    previewPanDragRef.current = {
+      pointerId: event.pointerId,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+      overlayWidthPx: rect.width,
+      overlayHeightPx: rect.height,
+      workspaceWidth,
+      workspaceHeight,
+      initialPanX: selectedTimelineItem.panX,
+      initialPanY: selectedTimelineItem.panY,
+      baseX,
+      baseY,
+      drawWidth,
+      drawHeight,
+      cropRect: normalizedCropRect
+    };
+    setIsDraggingPreviewPan(true);
+  }
+
   async function handleExport(): Promise<void> {
     if (editedSegments.length === 0 || isBusy) {
       return;
@@ -1446,15 +2331,13 @@ function App() {
     const videoBitrateValue = exportVideoBitrateInput.trim();
     const audioBitrateValue = exportAudioBitrateInput.trim();
 
-    let exportWidth: number | undefined;
-    let exportHeight: number | undefined;
     let exportFps: number | undefined;
     let exportVideoBitrateKbps: number | undefined;
     let exportAudioBitrateKbps: number | undefined;
 
     if (includeVideo) {
       if ((widthValue === "") !== (heightValue === "")) {
-        setError("Set both output width and height, or leave both empty.");
+        setError("Set both workspace width and height, or leave both empty.");
         return;
       }
 
@@ -1462,11 +2345,9 @@ function App() {
         const parsedWidth = parsePositiveIntegerInput(widthValue);
         const parsedHeight = parsePositiveIntegerInput(heightValue);
         if (!parsedWidth || !parsedHeight || parsedWidth < 2 || parsedHeight < 2) {
-          setError("Output resolution must use positive integers.");
+          setError("Workspace resolution must use positive integers.");
           return;
         }
-        exportWidth = parsedWidth;
-        exportHeight = parsedHeight;
       }
 
       if (fpsValue !== "") {
@@ -1518,6 +2399,9 @@ function App() {
           startSec: segment.sourceStart,
           endSec: segment.sourceEnd,
           speed: segment.speed,
+          scale: segment.scale,
+          panX: segment.panX,
+          panY: segment.panY,
           width: clip.width,
           height: clip.height
         };
@@ -1526,9 +2410,16 @@ function App() {
       const blob = await exportEditedTimeline(exportSegments, {
         mode: exportMode,
         format: exportFormat,
-        outputWidth: exportWidth,
-        outputHeight: exportHeight,
+        workspaceWidth: includeVideo ? workspaceWidth : undefined,
+        workspaceHeight: includeVideo ? workspaceHeight : undefined,
         fps: exportFps,
+        crop: {
+          enabled: cropEnabled,
+          x: normalizedCropRect.x,
+          y: normalizedCropRect.y,
+          width: normalizedCropRect.width,
+          height: normalizedCropRect.height
+        },
         includeVideo,
         includeAudio,
         videoBitrateKbps: exportVideoBitrateKbps,
@@ -1659,10 +2550,101 @@ function App() {
       <section className="preview-panel">
         <div className="preview-frame">
           {isPreviewSupported ? (
-            <canvas
-              ref={previewCanvasRef}
-              className="preview-canvas"
-            />
+            <div
+              ref={previewSurfaceRef}
+              className="preview-surface"
+            >
+              <canvas
+                ref={previewCanvasRef}
+                className="preview-canvas"
+              />
+              {clips.length > 0 && cropEnabled && (
+                <div
+                  className={`crop-overlay${isDraggingCrop ? " dragging" : ""}${
+                    isDraggingPreviewPan ? " panning" : ""
+                  }${selectedTimelineItem ? " has-pan" : ""}`}
+                >
+                  <div
+                    className="crop-mask-pane crop-mask-pane-top"
+                    style={{ top: "0%", left: "0%", width: "100%", height: `${cropRectPercent.top}%` }}
+                    onPointerDown={handlePreviewPanPointerDown}
+                  />
+                  <div
+                    className="crop-mask-pane crop-mask-pane-left"
+                    style={{
+                      top: `${cropRectPercent.top}%`,
+                      left: "0%",
+                      width: `${cropRectPercent.left}%`,
+                      height: `${cropRectPercent.height}%`
+                    }}
+                    onPointerDown={handlePreviewPanPointerDown}
+                  />
+                  <div
+                    className="crop-mask-pane crop-mask-pane-right"
+                    style={{
+                      top: `${cropRectPercent.top}%`,
+                      left: `${cropRectPercent.left + cropRectPercent.width}%`,
+                      width: `${cropMaskPercent.right}%`,
+                      height: `${cropRectPercent.height}%`
+                    }}
+                    onPointerDown={handlePreviewPanPointerDown}
+                  />
+                  <div
+                    className="crop-mask-pane crop-mask-pane-bottom"
+                    style={{
+                      top: `${cropRectPercent.top + cropRectPercent.height}%`,
+                      left: "0%",
+                      width: "100%",
+                      height: `${cropMaskPercent.bottom}%`
+                    }}
+                    onPointerDown={handlePreviewPanPointerDown}
+                  />
+                  <div
+                    className="crop-window"
+                    style={{
+                      left: `${cropRectPercent.left}%`,
+                      top: `${cropRectPercent.top}%`,
+                      width: `${cropRectPercent.width}%`,
+                      height: `${cropRectPercent.height}%`
+                    }}
+                    onPointerDown={(event) => handleCropPointerDown(event, "move")}
+                  >
+                    <span
+                      className="crop-handle crop-handle-edge crop-handle-top"
+                      onPointerDown={(event) => handleCropPointerDown(event, "top")}
+                    />
+                    <span
+                      className="crop-handle crop-handle-edge crop-handle-right"
+                      onPointerDown={(event) => handleCropPointerDown(event, "right")}
+                    />
+                    <span
+                      className="crop-handle crop-handle-edge crop-handle-bottom"
+                      onPointerDown={(event) => handleCropPointerDown(event, "bottom")}
+                    />
+                    <span
+                      className="crop-handle crop-handle-edge crop-handle-left"
+                      onPointerDown={(event) => handleCropPointerDown(event, "left")}
+                    />
+                    <span
+                      className="crop-handle crop-handle-corner crop-handle-top-left"
+                      onPointerDown={(event) => handleCropPointerDown(event, "top-left")}
+                    />
+                    <span
+                      className="crop-handle crop-handle-corner crop-handle-top-right"
+                      onPointerDown={(event) => handleCropPointerDown(event, "top-right")}
+                    />
+                    <span
+                      className="crop-handle crop-handle-corner crop-handle-bottom-left"
+                      onPointerDown={(event) => handleCropPointerDown(event, "bottom-left")}
+                    />
+                    <span
+                      className="crop-handle crop-handle-corner crop-handle-bottom-right"
+                      onPointerDown={(event) => handleCropPointerDown(event, "bottom-right")}
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
           ) : (
             <div className="preview-empty">
               <p>This browser does not support WebCodecs preview.</p>
@@ -1674,6 +2656,234 @@ function App() {
             </div>
           )}
         </div>
+        <div className="crop-controls">
+          <div className="crop-controls-row">
+            <p className="crop-controls-title">Crop</p>
+            <label className={`toggle-item${clips.length === 0 ? " disabled" : ""}`}>
+              <input
+                type="checkbox"
+                checked={cropEnabled}
+                onChange={(event) => setCropEnabled(event.target.checked)}
+                disabled={isBusy || clips.length === 0 || !exportSupportsVideo}
+              />
+              Enable Crop
+            </label>
+          </div>
+          <div className="crop-controls-row">
+            <label className={`toggle-item${clips.length === 0 ? " disabled" : ""}`}>
+              <input
+                type="checkbox"
+                checked={cropLockAspect}
+                onChange={(event) => {
+                  const nextChecked = event.target.checked;
+                  if (nextChecked && normalizedCropRect.height > 0) {
+                    setCropAspectRatio(normalizedCropRect.width / normalizedCropRect.height);
+                  }
+                  setCropLockAspect(nextChecked);
+                }}
+                disabled={isBusy || clips.length === 0 || !exportSupportsVideo}
+              />
+              Lock Aspect Ratio
+            </label>
+            <button
+              className="button ghost tiny"
+              type="button"
+              onClick={resetCropRect}
+              disabled={isBusy || clips.length === 0 || !exportSupportsVideo}
+            >
+              Reset Crop
+            </button>
+          </div>
+          <div className="crop-input-grid">
+            <label>
+              X
+              <input
+                className="time-input"
+                type="number"
+                step={1}
+                min={0}
+                value={normalizedCropRect.x}
+                onChange={(event) => setCropField("x", event.target.value)}
+                disabled={isBusy || clips.length === 0 || !exportSupportsVideo}
+              />
+            </label>
+            <label>
+              Y
+              <input
+                className="time-input"
+                type="number"
+                step={1}
+                min={0}
+                value={normalizedCropRect.y}
+                onChange={(event) => setCropField("y", event.target.value)}
+                disabled={isBusy || clips.length === 0 || !exportSupportsVideo}
+              />
+            </label>
+            <label>
+              W
+              <input
+                className="time-input"
+                type="number"
+                step={1}
+                min={MIN_CROP_SIZE_PX}
+                value={normalizedCropRect.width}
+                onChange={(event) => setCropField("width", event.target.value)}
+                disabled={isBusy || clips.length === 0 || !exportSupportsVideo}
+              />
+            </label>
+            <label>
+              H
+              <input
+                className="time-input"
+                type="number"
+                step={1}
+                min={MIN_CROP_SIZE_PX}
+                value={normalizedCropRect.height}
+                onChange={(event) => setCropField("height", event.target.value)}
+                disabled={isBusy || clips.length === 0 || !exportSupportsVideo}
+              />
+            </label>
+          </div>
+          <p className="hint">
+            Crop uses workspace pixels. Crop overlay is preview-only; the full frame remains visible in playback.
+          </p>
+          <p className="hint">
+            Mixed source sizes can show black areas until piece scale/pan is adjusted (for example with Fill Crop).
+          </p>
+          <p className="hint">
+            Tip: drag the shaded area outside the crop window to pan. Hold Shift while dragging to disable snapping.
+          </p>
+        </div>
+        {selectedTimelineItem ? (
+          <div className="piece-speed-panel preview-transform-panel">
+            <p className="hint">
+              Selected piece: {clipById.get(selectedTimelineItem.sourceClipId)?.file.name ?? "Unknown"} ·{" "}
+              {formatSecondsLabel(selectedTimelineItem.sourceStart)} -{" "}
+              {formatSecondsLabel(selectedTimelineItem.sourceEnd)}
+            </p>
+            <div className="piece-speed-header">
+              <span>Transform</span>
+              <strong>{formatScaleLabel(selectedTimelineItem.scale)}x</strong>
+            </div>
+            <label className="piece-speed-input-row">
+              <span>Scale</span>
+              <div className="piece-speed-input-wrap">
+                <input
+                  className="time-input piece-speed-input"
+                  type="number"
+                  min={MIN_PIECE_SCALE}
+                  max={MAX_PIECE_SCALE}
+                  step="any"
+                  value={selectedScaleInput}
+                  onChange={(event) => handleSelectedScaleInputChange(event.target.value)}
+                  onBlur={commitSelectedScaleInput}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      commitSelectedScaleInput();
+                      (event.currentTarget as HTMLInputElement).blur();
+                    }
+                  }}
+                  disabled={isBusy}
+                  aria-label="Selected piece scale input"
+                />
+                <span>x</span>
+              </div>
+            </label>
+            <input
+              className="piece-speed-slider"
+              type="range"
+              min={MIN_PIECE_SCALE_LOG}
+              max={MAX_PIECE_SCALE_LOG}
+              step={0.01}
+              value={selectedScaleSliderValue}
+              onChange={(event) =>
+                setSelectedTimelineTransform({
+                  scale: logSliderValueToScale(Number(event.target.value))
+                })
+              }
+              disabled={isBusy}
+              aria-label="Selected piece scale"
+            />
+            <div className="piece-speed-scale">
+              <span>{formatScaleLabel(MIN_PIECE_SCALE)}x</span>
+              <span>1x</span>
+              <span>{formatScaleLabel(MAX_PIECE_SCALE)}x</span>
+            </div>
+            <p className="hint">Log slider: 1x is centered. Values below 1 zoom out.</p>
+            <label className="piece-speed-input-row">
+              <span>Pan X</span>
+              <div className="piece-speed-input-wrap">
+                <input
+                  className="time-input piece-speed-input"
+                  type="number"
+                  step="any"
+                  value={selectedPanXInput}
+                  onChange={(event) => handleSelectedPanInputChange("x", event.target.value)}
+                  onBlur={() => commitSelectedPanInput("x")}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      commitSelectedPanInput("x");
+                      (event.currentTarget as HTMLInputElement).blur();
+                    }
+                  }}
+                  disabled={isBusy}
+                  aria-label="Selected piece pan X input"
+                />
+                <span>px</span>
+              </div>
+            </label>
+            <label className="piece-speed-input-row">
+              <span>Pan Y</span>
+              <div className="piece-speed-input-wrap">
+                <input
+                  className="time-input piece-speed-input"
+                  type="number"
+                  step="any"
+                  value={selectedPanYInput}
+                  onChange={(event) => handleSelectedPanInputChange("y", event.target.value)}
+                  onBlur={() => commitSelectedPanInput("y")}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      commitSelectedPanInput("y");
+                      (event.currentTarget as HTMLInputElement).blur();
+                    }
+                  }}
+                  disabled={isBusy}
+                  aria-label="Selected piece pan Y input"
+                />
+                <span>px</span>
+              </div>
+            </label>
+            <div className="piece-speed-presets">
+              <button
+                className="button ghost tiny"
+                type="button"
+                onClick={fillSelectedPieceToCrop}
+                disabled={isBusy}
+              >
+                Fill Crop
+              </button>
+              <button
+                className="button ghost tiny"
+                type="button"
+                onClick={resetSelectedTransform}
+                disabled={isBusy}
+              >
+                Reset Transform
+              </button>
+            </div>
+            <p className="hint">Transform is live on the selected piece in preview and always applied on export.</p>
+          </div>
+        ) : (
+          clips.length > 0 && (
+            <p className="hint">
+              Select a timeline piece to edit Scale/Pan directly next to the preview.
+            </p>
+          )
+        )}
       </section>
 
       <section className="edit-panel">
@@ -1943,7 +3153,7 @@ function App() {
                 </label>
 
                 <label>
-                  Width
+                  Workspace Width
                   <input
                     className="time-input"
                     type="number"
@@ -1957,7 +3167,7 @@ function App() {
                 </label>
 
                 <label>
-                  Height
+                  Workspace Height
                   <input
                     className="time-input"
                     type="number"
@@ -1995,7 +3205,7 @@ function App() {
                   }}
                   disabled={isBusy || !exportSupportsVideo}
                 >
-                  Auto Resolution
+                  Auto Workspace
                 </button>
                 <button
                   className="button ghost tiny"
@@ -2077,11 +3287,17 @@ function App() {
               )}
 
               <p className="hint">
-                Resolution auto uses the largest source clip ({autoResolutionLabel}). FPS auto keeps source timing.
+                Workspace auto uses the largest source clip ({autoResolutionLabel}). FPS auto keeps source timing.
               </p>
+              {exportSupportsVideo && (
+                <p className="hint">
+                  Crop coordinates use workspace pixels. Enabled crop outputs {normalizedCropRect.width} x{" "}
+                  {normalizedCropRect.height}.
+                </p>
+              )}
               {!exportSupportsVideo && (
                 <p className="hint">
-                  This format is audio-only. Resolution, FPS, and canvas mode are ignored.
+                  This format is audio-only. Workspace, crop, and FPS settings are ignored.
                 </p>
               )}
               {!exportSupportsAudio && <p className="hint">This format does not support audio.</p>}
@@ -2119,10 +3335,10 @@ function App() {
 
             <p className="hint">
               {!exportSupportsVideo
-                ? "Audio-only formats ignore canvas mode."
+                ? "Audio-only formats ignore workspace and crop settings."
                 : exportMode === "fit"
-                  ? "Fit Canvas keeps one output resolution and avoids stretching, but is slower."
-                  : "Fast Copy is quickest and may stretch/mismatch when source resolutions differ."}
+                  ? "Fit Canvas keeps a consistent workspace frame."
+                  : "Fast Copy is only available when no workspace, crop, transform, FPS, or speed changes are applied."}
             </p>
 
             {(isExporting || exportStage) && (

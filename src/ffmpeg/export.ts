@@ -30,6 +30,17 @@ export interface ExportSegment {
   startSec: number;
   endSec: number;
   speed: number;
+  scale: number;
+  panX: number;
+  panY: number;
+  width: number;
+  height: number;
+}
+
+export interface ExportCropConfig {
+  enabled: boolean;
+  x: number;
+  y: number;
   width: number;
   height: number;
 }
@@ -39,6 +50,9 @@ export interface ExportOptions {
   format?: ExportFormat;
   outputWidth?: number;
   outputHeight?: number;
+  workspaceWidth?: number;
+  workspaceHeight?: number;
+  crop?: ExportCropConfig;
   fps?: number;
   includeVideo?: boolean;
   includeAudio?: boolean;
@@ -64,6 +78,13 @@ function toFfmpegSeconds(value: number): string {
 function toEvenDimension(value: number): number {
   const rounded = Math.max(2, Math.round(value));
   return rounded % 2 === 0 ? rounded : rounded + 1;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) {
+    return min;
+  }
+  return Math.min(max, Math.max(min, value));
 }
 
 function toBlob(data: Uint8Array, mimeType: string): Blob {
@@ -104,8 +125,30 @@ function normalizeSpeed(value: number): number {
   return Math.min(1000, Math.max(0.001, value));
 }
 
+function normalizeSegmentScale(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    return 1;
+  }
+  return clamp(value, 0.001, 1000);
+}
+
+function normalizePan(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  return value;
+}
+
 function isSpeedNeutral(value: number): boolean {
   return Math.abs(value - 1) <= 0.000001;
+}
+
+function isTransformNeutral(scale: number, panX: number, panY: number): boolean {
+  return (
+    Math.abs(scale - 1) <= 0.000001 &&
+    Math.abs(panX) <= 0.000001 &&
+    Math.abs(panY) <= 0.000001
+  );
 }
 
 function buildAtempoFilter(speed: number): string {
@@ -138,6 +181,46 @@ function toFrameCount(durationSec: number, fps: number): number {
     return 0;
   }
   return Math.max(1, Math.round(durationSec * fps));
+}
+
+function normalizeCropConfig(
+  crop: ExportOptions["crop"],
+  workspaceWidth: number,
+  workspaceHeight: number
+): ExportCropConfig {
+  const fallback: ExportCropConfig = {
+    enabled: false,
+    x: 0,
+    y: 0,
+    width: workspaceWidth,
+    height: workspaceHeight
+  };
+
+  if (!crop) {
+    return fallback;
+  }
+
+  const width = toEvenDimension(clamp(Math.round(crop.width), 2, workspaceWidth));
+  const height = toEvenDimension(clamp(Math.round(crop.height), 2, workspaceHeight));
+  const maxX = Math.max(0, workspaceWidth - width);
+  const maxY = Math.max(0, workspaceHeight - height);
+  const x = clamp(Math.round(crop.x), 0, maxX);
+  const y = clamp(Math.round(crop.y), 0, maxY);
+
+  return {
+    enabled: Boolean(crop.enabled),
+    x,
+    y,
+    width,
+    height
+  };
+}
+
+function hasEffectiveCrop(crop: ExportCropConfig, workspaceWidth: number, workspaceHeight: number): boolean {
+  if (!crop.enabled) {
+    return false;
+  }
+  return crop.x !== 0 || crop.y !== 0 || crop.width !== workspaceWidth || crop.height !== workspaceHeight;
 }
 
 const EXPORT_FORMAT_CONFIG: Record<ExportFormat, ExportFormatConfig> = {
@@ -329,6 +412,9 @@ export async function exportEditedTimeline(
       startSec: Math.max(0, segment.startSec),
       endSec: Math.max(0, segment.endSec),
       speed: normalizeSpeed(segment.speed),
+      scale: normalizeSegmentScale(segment.scale),
+      panX: normalizePan(segment.panX),
+      panY: normalizePan(segment.panY),
       width: Math.max(0, Math.round(segment.width)),
       height: Math.max(0, Math.round(segment.height))
     }))
@@ -372,51 +458,46 @@ export async function exportEditedTimeline(
   const audioBitrateKbps = includeAudio
     ? normalizeOptionalBitrateKbps(options.audioBitrateKbps, 8, 3_200)
     : null;
-  const requestedWidth =
-    Number.isFinite(options.outputWidth) && (options.outputWidth as number) > 0
-      ? toEvenDimension(options.outputWidth as number)
-      : null;
-  const requestedHeight =
-    Number.isFinite(options.outputHeight) && (options.outputHeight as number) > 0
-      ? toEvenDimension(options.outputHeight as number)
-      : null;
-  const hasCustomResolution = requestedWidth !== null && requestedHeight !== null;
-  const targetWidth = requestedWidth ?? toEvenDimension(largestSegment.width);
-  const targetHeight = requestedHeight ?? toEvenDimension(largestSegment.height);
+  const requestedWorkspaceWidth =
+    Number.isFinite(options.workspaceWidth) && (options.workspaceWidth as number) > 0
+      ? toEvenDimension(options.workspaceWidth as number)
+      : Number.isFinite(options.outputWidth) && (options.outputWidth as number) > 0
+        ? toEvenDimension(options.outputWidth as number)
+        : null;
+  const requestedWorkspaceHeight =
+    Number.isFinite(options.workspaceHeight) && (options.workspaceHeight as number) > 0
+      ? toEvenDimension(options.workspaceHeight as number)
+      : Number.isFinite(options.outputHeight) && (options.outputHeight as number) > 0
+        ? toEvenDimension(options.outputHeight as number)
+        : null;
+  const hasCustomWorkspace =
+    requestedWorkspaceWidth !== null && requestedWorkspaceHeight !== null;
+  const workspaceWidth = requestedWorkspaceWidth ?? toEvenDimension(largestSegment.width);
+  const workspaceHeight = requestedWorkspaceHeight ?? toEvenDimension(largestSegment.height);
   const targetFps = normalizeOptionalFps(options.fps);
-  const fitScaleFilter =
-    `scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,` +
-    `pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`;
-  const stretchScaleFilter = `scale=${targetWidth}:${targetHeight},setsar=1`;
-  const hasResolutionMismatch = sanitizedSegments.some(
-    (segment) => segment.width !== targetWidth || segment.height !== targetHeight
+  const hasWorkspaceMismatch = sanitizedSegments.some(
+    (segment) => segment.width !== workspaceWidth || segment.height !== workspaceHeight
   );
   const hasSpeedChange = sanitizedSegments.some((segment) => !isSpeedNeutral(segment.speed));
-  const shouldNormalize = includeVideo && exportMode === "fit" && hasResolutionMismatch;
-  const shouldStretchResize =
-    includeVideo && exportMode === "fast" && hasCustomResolution && hasResolutionMismatch;
+  const hasPieceTransform = sanitizedSegments.some(
+    (segment) => !isTransformNeutral(segment.scale, segment.panX, segment.panY)
+  );
+  const cropConfig = normalizeCropConfig(options.crop, workspaceWidth, workspaceHeight);
+  const shouldApplyCrop = includeVideo && hasEffectiveCrop(cropConfig, workspaceWidth, workspaceHeight);
+  const needsWorkspaceComposition =
+    includeVideo && (hasWorkspaceMismatch || hasCustomWorkspace || hasPieceTransform || shouldApplyCrop);
   const shouldApplyFps = includeVideo && targetFps !== null;
   const canUseFastPath =
-    !shouldNormalize && !shouldStretchResize && !shouldApplyFps && !hasSpeedChange;
+    !needsWorkspaceComposition && !shouldApplyFps && !hasSpeedChange;
   const needsFinalConvert =
     exportFormat !== "mp4" ||
     !includeVideo ||
     !includeAudio ||
     videoBitrateKbps !== null ||
     audioBitrateKbps !== null;
-  const baseFilters: string[] = [];
-  if (shouldNormalize) {
-    baseFilters.push(fitScaleFilter);
-  } else if (shouldStretchResize) {
-    baseFilters.push(stretchScaleFilter);
-  }
-  if (shouldApplyFps && targetFps !== null) {
-    baseFilters.push(`fps=${targetFps}`);
-  }
-  const baseVideoFilter = baseFilters.length > 0 ? baseFilters.join(",") : null;
-  const reencodePreset = baseVideoFilter ? "ultrafast" : "veryfast";
-  const reencodeCrf = baseVideoFilter ? "28" : "23";
-  const reencodeAudioBitrate = baseVideoFilter ? "96k" : "128k";
+  const reencodePreset = needsWorkspaceComposition || hasSpeedChange || shouldApplyFps ? "ultrafast" : "veryfast";
+  const reencodeCrf = needsWorkspaceComposition || hasSpeedChange || shouldApplyFps ? "28" : "23";
+  const reencodeAudioBitrate = hasSpeedChange ? "96k" : "128k";
   const progressFps = targetFps ?? 30;
   const segmentFrameBudgets = sanitizedSegments.map((segment) => {
     const timelineDuration = (segment.endSec - segment.startSec) / Math.max(0.001, segment.speed);
@@ -459,16 +540,18 @@ export async function exportEditedTimeline(
     includeAudio,
     videoBitrateKbps,
     audioBitrateKbps,
-    hasCustomResolution,
-    hasResolutionMismatch,
+    hasCustomWorkspace,
+    hasWorkspaceMismatch,
+    hasPieceTransform,
     hasSpeedChange,
     targetFps,
-    targetWidth,
-    targetHeight,
+    workspaceWidth,
+    workspaceHeight,
+    cropConfig,
+    shouldApplyCrop,
     canUseFastPath,
     needsFinalConvert,
-    shouldStretchResize,
-    shouldNormalize,
+    needsWorkspaceComposition,
     reencodePreset,
     reencodeCrf,
     reencodeAudioBitrate,
@@ -625,24 +708,16 @@ export async function exportEditedTimeline(
         frameTracker.addPlannedFrames(timelineFrameBudget);
       }
 
-      const fallbackNeedsStretch =
-        hasResolutionMismatch && exportMode === "fast" && !shouldNormalize && !shouldStretchResize;
-      const reencodeBaseFilters = [...baseFilters];
-      if (fallbackNeedsStretch) {
-        reencodeBaseFilters.unshift(stretchScaleFilter);
-      }
-
+      const reencodeMessage = needsWorkspaceComposition
+        ? "Compositing timeline into workspace (software encode, may take a while)..."
+        : shouldApplyFps
+          ? "Applying export FPS (software encode, may take a while)..."
+          : hasSpeedChange
+            ? "Applying speed changes (software encode, may take a while)..."
+            : "Re-encoding timeline segments...";
       options.onStageChange?.(
         "processing-reencode",
-        shouldNormalize
-          ? "Normalizing resolution (software encode, may take a while)..."
-          : fallbackNeedsStretch || shouldStretchResize
-            ? "Applying export resolution (software encode, may take a while)..."
-            : shouldApplyFps
-              ? "Applying export FPS (software encode, may take a while)..."
-              : hasSpeedChange
-                ? "Applying speed changes (software encode, may take a while)..."
-                : "Re-encoding timeline segments..."
+        reencodeMessage
       );
       await cleanupFiles(ffmpeg, [...segmentPaths, inputListPath, timelineOutputPath]);
 
@@ -655,9 +730,76 @@ export async function exportEditedTimeline(
 
         const duration = segment.endSec - segment.startSec;
         const segmentPath = segmentPaths[index];
-        const segmentVideoFilters = [...reencodeBaseFilters];
-        if (includeVideo && !isSpeedNeutral(segment.speed)) {
-          segmentVideoFilters.push(`setpts=PTS/${segment.speed.toFixed(6)}`);
+        const segmentVideoFilters: string[] = [];
+        if (includeVideo) {
+          segmentVideoFilters.push(
+            `scale=${workspaceWidth}:${workspaceHeight}:force_original_aspect_ratio=decrease,` +
+              `pad=${workspaceWidth}:${workspaceHeight}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`
+          );
+
+          const hasSegmentTransform = !isTransformNeutral(
+            segment.scale,
+            segment.panX,
+            segment.panY
+          );
+          let internalPanX = 0;
+          let internalPanY = 0;
+
+          if (hasSegmentTransform) {
+            const scaledWidth = Math.max(2, toEvenDimension(workspaceWidth * segment.scale));
+            const scaledHeight = Math.max(2, toEvenDimension(workspaceHeight * segment.scale));
+            segmentVideoFilters.push(`scale=${scaledWidth}:${scaledHeight}:flags=lanczos`);
+
+            const internalMaxPanX = Math.abs(scaledWidth - workspaceWidth) / 2;
+            const internalMaxPanY = Math.abs(scaledHeight - workspaceHeight) / 2;
+            internalPanX = clamp(segment.panX, -internalMaxPanX, internalMaxPanX);
+            internalPanY = clamp(segment.panY, -internalMaxPanY, internalMaxPanY);
+
+            if (scaledWidth >= workspaceWidth && scaledHeight >= workspaceHeight) {
+              const cropX = Math.round((scaledWidth - workspaceWidth) / 2 - internalPanX);
+              const cropY = Math.round((scaledHeight - workspaceHeight) / 2 - internalPanY);
+              segmentVideoFilters.push(`crop=${workspaceWidth}:${workspaceHeight}:${cropX}:${cropY}`);
+            } else {
+              const padX = Math.round((workspaceWidth - scaledWidth) / 2 + internalPanX);
+              const padY = Math.round((workspaceHeight - scaledHeight) / 2 + internalPanY);
+              segmentVideoFilters.push(
+                `pad=${workspaceWidth}:${workspaceHeight}:${padX}:${padY}:color=black`
+              );
+            }
+          }
+
+          if (hasSegmentTransform || shouldApplyCrop) {
+            const outW = shouldApplyCrop ? cropConfig.width : workspaceWidth;
+            const outH = shouldApplyCrop ? cropConfig.height : workspaceHeight;
+            const anchorX = shouldApplyCrop ? cropConfig.x : 0;
+            const anchorY = shouldApplyCrop ? cropConfig.y : 0;
+
+            const remainingPanX = segment.panX - internalPanX;
+            const remainingPanY = segment.panY - internalPanY;
+            const remMinX = anchorX - workspaceWidth;
+            const remMaxX = anchorX + outW;
+            const remMinY = anchorY - workspaceHeight;
+            const remMaxY = anchorY + outH;
+            const clampedRemainingX = clamp(remainingPanX, remMinX, remMaxX);
+            const clampedRemainingY = clamp(remainingPanY, remMinY, remMaxY);
+
+            const paddedWidth = workspaceWidth + outW * 2;
+            const paddedHeight = workspaceHeight + outH * 2;
+            segmentVideoFilters.push(
+              `pad=${paddedWidth}:${paddedHeight}:${outW}:${outH}:color=black`
+            );
+            const cropX = Math.round(outW + anchorX - clampedRemainingX);
+            const cropY = Math.round(outH + anchorY - clampedRemainingY);
+            segmentVideoFilters.push(`crop=${outW}:${outH}:${cropX}:${cropY}`);
+          }
+
+          if (!isSpeedNeutral(segment.speed)) {
+            segmentVideoFilters.push(`setpts=PTS/${segment.speed.toFixed(6)}`);
+          }
+
+          if (shouldApplyFps && targetFps !== null) {
+            segmentVideoFilters.push(`fps=${targetFps}`);
+          }
         }
         const segmentVideoFilter =
           segmentVideoFilters.length > 0 ? segmentVideoFilters.join(",") : null;
