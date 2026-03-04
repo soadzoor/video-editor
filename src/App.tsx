@@ -1,4 +1,5 @@
 import {
+  CSSProperties,
   ChangeEvent,
   DragEvent as ReactDragEvent,
   MouseEvent as ReactMouseEvent,
@@ -129,6 +130,38 @@ interface PlayheadDragState {
 }
 
 type TimelineTool = "select" | "razor";
+type DockTab = "timeline" | "export";
+type UtilityTab = "crop" | "inspector";
+type ActiveSplitter = "left" | "right" | null;
+
+interface WorkspacePaneSizes {
+  left: number;
+  right: number;
+}
+
+interface PersistedLayoutV1 {
+  left: number;
+  right: number;
+  dockTab: DockTab;
+  leftCollapsed?: boolean;
+  rightCollapsed?: boolean;
+}
+
+interface InspectorOpenState {
+  segment: boolean;
+  crop: boolean;
+  transform: boolean;
+  speed: boolean;
+  advancedExport: boolean;
+}
+
+interface SplitterDragState {
+  splitter: Exclude<ActiveSplitter, null>;
+  pointerId: number;
+  startClientX: number;
+  startClientY: number;
+  startSizes: WorkspacePaneSizes;
+}
 
 const EXPORT_FORMAT_OPTIONS: Array<{ value: ExportFormat; label: string }> = [
   { value: "mp4", label: "MP4 (H.264)" },
@@ -153,6 +186,18 @@ const MIN_PIECE_SCALE = 0.001;
 const MAX_PIECE_SCALE = 1000;
 const MIN_PIECE_SCALE_LOG = Math.log10(MIN_PIECE_SCALE);
 const MAX_PIECE_SCALE_LOG = Math.log10(MAX_PIECE_SCALE);
+const DESKTOP_BREAKPOINT_PX = 1200;
+const LAYOUT_STORAGE_KEY = "videoEditor.layout.v1";
+const DEFAULT_DOCK_TAB: DockTab = "timeline";
+const DEFAULT_PANE_SIZES: WorkspacePaneSizes = {
+  left: 280,
+  right: 360
+};
+const PANE_BOUNDS = {
+  left: { min: 220, max: 420 },
+  right: { min: 300, max: 520 }
+} as const;
+const COLLAPSED_PANEL_WIDTH_PX = 42;
 
 function makeId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -170,6 +215,52 @@ function clamp(value: number, min: number, max: number): number {
 
 function nearlyEqual(a: number, b: number): boolean {
   return Math.abs(a - b) <= 0.000001;
+}
+
+function clampPaneSizes(sizes: WorkspacePaneSizes): WorkspacePaneSizes {
+  return {
+    left: Math.round(clamp(sizes.left, PANE_BOUNDS.left.min, PANE_BOUNDS.left.max)),
+    right: Math.round(clamp(sizes.right, PANE_BOUNDS.right.min, PANE_BOUNDS.right.max))
+  };
+}
+
+function readPersistedLayout(): PersistedLayoutV1 | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  try {
+    const raw = window.localStorage.getItem(LAYOUT_STORAGE_KEY);
+    if (!raw) {
+      return null;
+    }
+    const parsed = JSON.parse(raw) as Partial<PersistedLayoutV1>;
+    const left = Number(parsed.left);
+    const right = Number(parsed.right);
+    const dockTab = parsed.dockTab;
+    if (
+      !parsed ||
+      !Number.isFinite(left) ||
+      !Number.isFinite(right) ||
+      (dockTab !== "timeline" && dockTab !== "export")
+    ) {
+      return null;
+    }
+
+    return {
+      left,
+      right,
+      dockTab,
+      leftCollapsed: parsed.leftCollapsed === true,
+      rightCollapsed: parsed.rightCollapsed === true
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isDesktopViewportWidth(width: number): boolean {
+  return width >= DESKTOP_BREAKPOINT_PX;
 }
 
 function formatDuration(seconds: number): string {
@@ -255,6 +346,29 @@ function parsePositiveIntegerInput(value: string): number | null {
     return null;
   }
   return Math.round(parsed);
+}
+
+function parseNonNegativeIntegerInput(value: string): number | null {
+  if (!/^\d+$/.test(value.trim())) {
+    return null;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return null;
+  }
+  return Math.round(parsed);
+}
+
+function durationPartsFromSeconds(seconds: number): {
+  minutes: number;
+  seconds: number;
+  milliseconds: number;
+} {
+  const totalMs = Math.max(0, Math.round(seconds * 1000));
+  const minutes = Math.floor(totalMs / 60000);
+  const secondsPart = Math.floor((totalMs % 60000) / 1000);
+  const milliseconds = totalMs % 1000;
+  return { minutes, seconds: secondsPart, milliseconds };
 }
 
 function normalizeTimeValue(value: number): number {
@@ -718,16 +832,48 @@ function App() {
   const [exportWidthInput, setExportWidthInput] = useState("");
   const [exportHeightInput, setExportHeightInput] = useState("");
   const [exportFpsInput, setExportFpsInput] = useState("");
-  const [isExportAdvancedOpen, setIsExportAdvancedOpen] = useState(false);
   const [includeVideoInExport, setIncludeVideoInExport] = useState(true);
   const [includeAudioInExport, setIncludeAudioInExport] = useState(true);
   const [exportVideoBitrateInput, setExportVideoBitrateInput] = useState("");
   const [exportAudioBitrateInput, setExportAudioBitrateInput] = useState("");
+  const [dockTab, setDockTab] = useState<DockTab>(() => readPersistedLayout()?.dockTab ?? DEFAULT_DOCK_TAB);
+  const [utilityTab, setUtilityTab] = useState<UtilityTab>("crop");
+  const [workspacePaneSizes, setWorkspacePaneSizes] = useState<WorkspacePaneSizes>(() => {
+    const persisted = readPersistedLayout();
+    return clampPaneSizes(
+      persisted
+        ? {
+            left: persisted.left,
+            right: persisted.right
+          }
+        : DEFAULT_PANE_SIZES
+    );
+  });
+  const [isLeftPanelCollapsed, setIsLeftPanelCollapsed] = useState(
+    () => readPersistedLayout()?.leftCollapsed === true
+  );
+  const [isRightPanelCollapsed, setIsRightPanelCollapsed] = useState(
+    () => readPersistedLayout()?.rightCollapsed === true
+  );
+  const [activeSplitter, setActiveSplitter] = useState<ActiveSplitter>(null);
+  const [isDesktopViewport, setIsDesktopViewport] = useState(() =>
+    typeof window === "undefined" ? true : isDesktopViewportWidth(window.innerWidth)
+  );
+  const [inspectorOpenState, setInspectorOpenState] = useState<InspectorOpenState>({
+    segment: true,
+    crop: true,
+    transform: true,
+    speed: true,
+    advancedExport: false
+  });
 
   const [isDraggingTrimEdge, setIsDraggingTrimEdge] = useState(false);
   const [activeTrimEdge, setActiveTrimEdge] = useState<"start" | "end" | null>(null);
   const [isDraggingPlayhead, setIsDraggingPlayhead] = useState(false);
   const [selectedSpeedInput, setSelectedSpeedInput] = useState("");
+  const [selectedDurationMinutesInput, setSelectedDurationMinutesInput] = useState("");
+  const [selectedDurationSecondsInput, setSelectedDurationSecondsInput] = useState("");
+  const [selectedDurationMillisecondsInput, setSelectedDurationMillisecondsInput] = useState("");
   const [selectedScaleInput, setSelectedScaleInput] = useState("");
   const [selectedPanXInput, setSelectedPanXInput] = useState("");
   const [selectedPanYInput, setSelectedPanYInput] = useState("");
@@ -755,7 +901,10 @@ function App() {
   const togglePlayPauseRef = useRef<() => void>(() => undefined);
   const cropDragRef = useRef<CropDragState | null>(null);
   const previewPanDragRef = useRef<PreviewPanDragState | null>(null);
+  const splitterDragRef = useRef<SplitterDragState | null>(null);
   const previousWorkspaceSizeRef = useRef<{ width: number; height: number } | null>(null);
+  const previousSelectedTimelineItemIdRef = useRef<string | null>(null);
+  const previousCropEnabledRef = useRef(false);
 
   const trimRangeShellRef = useRef<HTMLDivElement>(null);
   const trimWindowDragRef = useRef<TrimWindowDragState | null>(null);
@@ -949,6 +1098,19 @@ function App() {
     largestClipResolution.area > 0
       ? `${largestClipResolution.width} x ${largestClipResolution.height}`
       : "none";
+  const totalSourceDurationSec = useMemo(
+    () => clips.reduce((sum, clip) => sum + clip.duration, 0),
+    [clips]
+  );
+  const effectiveLeftPaneWidth = isDesktopViewport && isLeftPanelCollapsed ? COLLAPSED_PANEL_WIDTH_PX : workspacePaneSizes.left;
+  const effectiveRightPaneWidth =
+    isDesktopViewport && isRightPanelCollapsed ? COLLAPSED_PANEL_WIDTH_PX : workspacePaneSizes.right;
+  const workstationStyle: CSSProperties = {
+    "--workspace-left": `${effectiveLeftPaneWidth}px`,
+    "--workspace-right": `${effectiveRightPaneWidth}px`,
+    "--workspace-splitter-left": isDesktopViewport && isLeftPanelCollapsed ? "0px" : "8px",
+    "--workspace-splitter-right": isDesktopViewport && isRightPanelCollapsed ? "0px" : "8px"
+  } as CSSProperties;
   const previewClips = useMemo<PreviewClip[]>(
     () =>
       clips.map((clip) => ({
@@ -1014,6 +1176,143 @@ function App() {
   useEffect(() => {
     previewSegmentsRef.current = previewTimelineSegments;
   }, [previewTimelineSegments]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const handleResize = (): void => {
+      setIsDesktopViewport(isDesktopViewportWidth(window.innerWidth));
+    };
+
+    handleResize();
+    window.addEventListener("resize", handleResize);
+    return () => {
+      window.removeEventListener("resize", handleResize);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const payload: PersistedLayoutV1 = {
+      left: workspacePaneSizes.left,
+      right: workspacePaneSizes.right,
+      dockTab,
+      leftCollapsed: isLeftPanelCollapsed,
+      rightCollapsed: isRightPanelCollapsed
+    };
+
+    try {
+      window.localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(payload));
+    } catch {
+      // Ignore persistence errors (private mode, quota, etc.)
+    }
+  }, [
+    dockTab,
+    isLeftPanelCollapsed,
+    isRightPanelCollapsed,
+    workspacePaneSizes.left,
+    workspacePaneSizes.right
+  ]);
+
+  useEffect(() => {
+    if (!isDesktopViewport && activeSplitter !== null) {
+      splitterDragRef.current = null;
+      setActiveSplitter(null);
+    }
+  }, [activeSplitter, isDesktopViewport]);
+
+  useEffect(() => {
+    if (
+      (isLeftPanelCollapsed && activeSplitter === "left") ||
+      (isRightPanelCollapsed && activeSplitter === "right")
+    ) {
+      splitterDragRef.current = null;
+      setActiveSplitter(null);
+    }
+  }, [activeSplitter, isLeftPanelCollapsed, isRightPanelCollapsed]);
+
+  useEffect(() => {
+    const previousSelected = previousSelectedTimelineItemIdRef.current;
+    if (selectedTimelineItemId && selectedTimelineItemId !== previousSelected) {
+      setInspectorOpenState((previous) => ({
+        ...previous,
+        segment: true,
+        speed: true,
+        transform: true
+      }));
+    }
+    previousSelectedTimelineItemIdRef.current = selectedTimelineItemId;
+  }, [selectedTimelineItemId]);
+
+  useEffect(() => {
+    const wasEnabled = previousCropEnabledRef.current;
+    if (cropEnabled && !wasEnabled) {
+      setInspectorOpenState((previous) => ({
+        ...previous,
+        crop: true
+      }));
+    }
+    previousCropEnabledRef.current = cropEnabled;
+  }, [cropEnabled]);
+
+  useEffect(() => {
+    if (activeSplitter === null || !isDesktopViewport) {
+      return;
+    }
+
+    const handlePointerMove = (event: PointerEvent): void => {
+      const drag = splitterDragRef.current;
+      if (!drag || event.pointerId !== drag.pointerId) {
+        return;
+      }
+
+      event.preventDefault();
+
+      let nextSizes = drag.startSizes;
+      if (drag.splitter === "left") {
+        const deltaX = event.clientX - drag.startClientX;
+        nextSizes = {
+          ...drag.startSizes,
+          left: drag.startSizes.left + deltaX
+        };
+      } else {
+        const deltaX = event.clientX - drag.startClientX;
+        nextSizes = {
+          ...drag.startSizes,
+          right: drag.startSizes.right - deltaX
+        };
+      }
+
+      setWorkspacePaneSizes(clampPaneSizes(nextSizes));
+    };
+
+    const stopDragging = (event?: PointerEvent): void => {
+      const drag = splitterDragRef.current;
+      if (!drag) {
+        return;
+      }
+      if (event && event.pointerId !== drag.pointerId) {
+        return;
+      }
+      splitterDragRef.current = null;
+      setActiveSplitter(null);
+    };
+
+    window.addEventListener("pointermove", handlePointerMove, { passive: false });
+    window.addEventListener("pointerup", stopDragging);
+    window.addEventListener("pointercancel", stopDragging);
+
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", stopDragging);
+      window.removeEventListener("pointercancel", stopDragging);
+    };
+  }, [activeSplitter, isDesktopViewport]);
 
   useEffect(() => {
     setCropRect((previous) => {
@@ -1144,6 +1443,28 @@ function App() {
   }, [isPreviewSupported, previewClips, previewSegments, workspaceHeight, workspaceWidth]);
 
   useEffect(() => {
+    if (!isPreviewSupported) {
+      return;
+    }
+    const engine = previewEngineRef.current;
+    if (!engine || previewTimelineSegments.length === 0) {
+      return;
+    }
+    const upperBound = Math.max(0, previewDurationSec - 0.0001);
+    const bounded = clamp(engine.getPositionSec(), 0, upperBound);
+    engine.seek(bounded);
+  }, [
+    dockTab,
+    isLeftPanelCollapsed,
+    isPreviewSupported,
+    isRightPanelCollapsed,
+    previewDurationSec,
+    previewTimelineSegments.length,
+    workspacePaneSizes.left,
+    workspacePaneSizes.right
+  ]);
+
+  useEffect(() => {
     if (selectedTimelineItemId && !timelineItems.some((item) => item.id === selectedTimelineItemId)) {
       setSelectedTimelineItemId(null);
     }
@@ -1158,18 +1479,26 @@ function App() {
   useEffect(() => {
     if (!selectedTimelineItem) {
       setSelectedSpeedInput("");
+      setSelectedDurationMinutesInput("");
+      setSelectedDurationSecondsInput("");
+      setSelectedDurationMillisecondsInput("");
       setSelectedScaleInput("");
       setSelectedPanXInput("");
       setSelectedPanYInput("");
       return;
     }
+    const durationParts = durationPartsFromSeconds(selectedTimelineItem.duration);
     setSelectedSpeedInput(formatSpeedLabel(selectedTimelineItem.speed));
+    setSelectedDurationMinutesInput(durationParts.minutes.toString());
+    setSelectedDurationSecondsInput(durationParts.seconds.toString());
+    setSelectedDurationMillisecondsInput(durationParts.milliseconds.toString());
     setSelectedScaleInput(formatScaleLabel(selectedTimelineItem.scale));
     setSelectedPanXInput(normalizePanValue(selectedTimelineItem.panX).toString());
     setSelectedPanYInput(normalizePanValue(selectedTimelineItem.panY).toString());
   }, [
     selectedTimelineItemId,
     selectedTimelineItem?.speed,
+    selectedTimelineItem?.duration,
     selectedTimelineItem?.scale,
     selectedTimelineItem?.panX,
     selectedTimelineItem?.panY
@@ -2015,6 +2344,54 @@ function App() {
     setError(null);
   }
 
+  function applySelectedDurationInputs(
+    minutesText: string,
+    secondsText: string,
+    millisecondsText: string,
+    forceResetOnInvalid: boolean
+  ): void {
+    if (!selectedTimelineItem) {
+      return;
+    }
+
+    const minutes = parseNonNegativeIntegerInput(minutesText);
+    const seconds = parseNonNegativeIntegerInput(secondsText);
+    const milliseconds = parseNonNegativeIntegerInput(millisecondsText);
+
+    if (minutes === null || seconds === null || milliseconds === null) {
+      if (forceResetOnInvalid) {
+        const fallback = durationPartsFromSeconds(selectedTimelineItem.duration);
+        setSelectedDurationMinutesInput(fallback.minutes.toString());
+        setSelectedDurationSecondsInput(fallback.seconds.toString());
+        setSelectedDurationMillisecondsInput(fallback.milliseconds.toString());
+      }
+      return;
+    }
+
+    const totalMilliseconds = minutes * 60000 + seconds * 1000 + milliseconds;
+    if (totalMilliseconds <= 0) {
+      if (forceResetOnInvalid) {
+        const fallback = durationPartsFromSeconds(selectedTimelineItem.duration);
+        setSelectedDurationMinutesInput(fallback.minutes.toString());
+        setSelectedDurationSecondsInput(fallback.seconds.toString());
+        setSelectedDurationMillisecondsInput(fallback.milliseconds.toString());
+      }
+      return;
+    }
+
+    const sourceDuration = Math.max(
+      0,
+      selectedTimelineItem.sourceEnd - selectedTimelineItem.sourceStart
+    );
+    if (sourceDuration <= 0) {
+      return;
+    }
+
+    const targetDuration = totalMilliseconds / 1000;
+    const clampedSpeed = clampSpeed(sourceDuration / targetDuration);
+    setSelectedTimelineSpeed(clampedSpeed);
+  }
+
   function setSelectedTimelineTransform(next: {
     scale?: number;
     panX?: number;
@@ -2068,6 +2445,35 @@ function App() {
     const clampedSpeed = clampSpeed(parsed);
     setSelectedTimelineSpeed(clampedSpeed);
     setSelectedSpeedInput(formatSpeedLabel(clampedSpeed));
+  }
+
+  function handleSelectedDurationInputChange(
+    part: "minutes" | "seconds" | "milliseconds",
+    value: string
+  ): void {
+    const nextMinutes = part === "minutes" ? value : selectedDurationMinutesInput;
+    const nextSeconds = part === "seconds" ? value : selectedDurationSecondsInput;
+    const nextMilliseconds =
+      part === "milliseconds" ? value : selectedDurationMillisecondsInput;
+
+    if (part === "minutes") {
+      setSelectedDurationMinutesInput(value);
+    } else if (part === "seconds") {
+      setSelectedDurationSecondsInput(value);
+    } else {
+      setSelectedDurationMillisecondsInput(value);
+    }
+
+    applySelectedDurationInputs(nextMinutes, nextSeconds, nextMilliseconds, false);
+  }
+
+  function commitSelectedDurationInput(): void {
+    applySelectedDurationInputs(
+      selectedDurationMinutesInput,
+      selectedDurationSecondsInput,
+      selectedDurationMillisecondsInput,
+      true
+    );
   }
 
   function handleSelectedScaleInputChange(value: string): void {
@@ -2313,6 +2719,36 @@ function App() {
     setIsDraggingPreviewPan(true);
   }
 
+  function handleSplitterPointerDown(
+    event: ReactPointerEvent<HTMLDivElement>,
+    splitter: Exclude<ActiveSplitter, null>
+  ): void {
+    if (event.button !== 0 || !isDesktopViewport) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    splitterDragRef.current = {
+      splitter,
+      pointerId: event.pointerId,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+      startSizes: workspacePaneSizes
+    };
+    setActiveSplitter(splitter);
+  }
+
+  function resetSplitterSize(splitter: Exclude<ActiveSplitter, null>): void {
+    setWorkspacePaneSizes((previous) =>
+      clampPaneSizes({
+        ...previous,
+        [splitter]: DEFAULT_PANE_SIZES[splitter]
+      })
+    );
+  }
+
   async function handleExport(): Promise<void> {
     if (editedSegments.length === 0 || isBusy) {
       return;
@@ -2461,908 +2897,1278 @@ function App() {
     }
   }
 
-  return (
-    <main className="app-shell">
-      <header className="hero">
-        <p className="eyebrow">Timeline Editor</p>
-        <h1>Browser Video Editor</h1>
-        <p className="hero-copy">
-          Add one or more videos, edit on a single timeline, then export once.
-        </p>
-      </header>
+  const mediaBinContent = (
+    <>
+      <div className="panel-header">
+        <p className="panel-title">Media Bin</p>
+        <div className="panel-header-actions">
+          <button
+            className="button secondary tiny"
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={isBusy}
+          >
+            {isIngesting ? "Loading..." : "Import"}
+          </button>
+          <button
+            className="button ghost tiny"
+            type="button"
+            onClick={clearQueue}
+            disabled={clips.length === 0 || isBusy}
+          >
+            Clear
+          </button>
+        </div>
+      </div>
 
-      <section
-        className={`dropzone ${isDragging ? "dragging" : ""}`}
+      <div
+        className={`media-dropzone ${isDragging ? "dragging" : ""}`}
         onDrop={(event) => void handleDrop(event)}
         onDragOver={handleDragOver}
         onDragEnter={handleDragOver}
         onDragLeave={handleDragLeave}
       >
-        <div className="dropzone-content">
-          <p className="dropzone-title">Drag and drop videos</p>
-          <p className="dropzone-subtitle">
-            Multiple videos are concatenated by default in timeline order.
+        <p className="dropzone-title">Drop videos here</p>
+        <p className="dropzone-subtitle">Multiple files are concatenated by timeline order.</p>
+      </div>
+
+      <div className="media-metrics">
+        <span className="metric-chip">Clips {clips.length}</span>
+        <span className="metric-chip">Source {formatDuration(totalSourceDurationSec)}</span>
+      </div>
+
+      {clips.length === 0 ? (
+        <p className="queue-empty">No clips yet.</p>
+      ) : (
+        <ul className="queue-list">
+          {clips.map((clip, index) => (
+            <li
+              key={clip.id}
+              className="queue-item"
+            >
+              <div className="queue-select">
+                <span className="queue-order">{index + 1}</span>
+                <span className="queue-name">{clip.file.name}</span>
+                <span className="queue-size">
+                  {formatDuration(clip.duration)} · {formatFileSize(clip.file.size)}
+                </span>
+              </div>
+              <button
+                className="button ghost tiny"
+                type="button"
+                onClick={() => removeClip(clip.id)}
+                disabled={isBusy}
+              >
+                Remove
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </>
+  );
+
+  const previewStageContent = (
+    <>
+      <div className="preview-frame">
+        {isPreviewSupported ? (
+          <div
+            ref={previewSurfaceRef}
+            className="preview-surface"
+          >
+            <canvas
+              ref={previewCanvasRef}
+              className="preview-canvas"
+            />
+            {clips.length > 0 && cropEnabled && (
+              <div
+                className={`crop-overlay${isDraggingCrop ? " dragging" : ""}${
+                  isDraggingPreviewPan ? " panning" : ""
+                }${selectedTimelineItem ? " has-pan" : ""}`}
+              >
+                <div
+                  className="crop-mask-pane crop-mask-pane-top"
+                  style={{ top: "0%", left: "0%", width: "100%", height: `${cropRectPercent.top}%` }}
+                  onPointerDown={handlePreviewPanPointerDown}
+                />
+                <div
+                  className="crop-mask-pane crop-mask-pane-left"
+                  style={{
+                    top: `${cropRectPercent.top}%`,
+                    left: "0%",
+                    width: `${cropRectPercent.left}%`,
+                    height: `${cropRectPercent.height}%`
+                  }}
+                  onPointerDown={handlePreviewPanPointerDown}
+                />
+                <div
+                  className="crop-mask-pane crop-mask-pane-right"
+                  style={{
+                    top: `${cropRectPercent.top}%`,
+                    left: `${cropRectPercent.left + cropRectPercent.width}%`,
+                    width: `${cropMaskPercent.right}%`,
+                    height: `${cropRectPercent.height}%`
+                  }}
+                  onPointerDown={handlePreviewPanPointerDown}
+                />
+                <div
+                  className="crop-mask-pane crop-mask-pane-bottom"
+                  style={{
+                    top: `${cropRectPercent.top + cropRectPercent.height}%`,
+                    left: "0%",
+                    width: "100%",
+                    height: `${cropMaskPercent.bottom}%`
+                  }}
+                  onPointerDown={handlePreviewPanPointerDown}
+                />
+                <div
+                  className="crop-window"
+                  style={{
+                    left: `${cropRectPercent.left}%`,
+                    top: `${cropRectPercent.top}%`,
+                    width: `${cropRectPercent.width}%`,
+                    height: `${cropRectPercent.height}%`
+                  }}
+                  onPointerDown={(event) => handleCropPointerDown(event, "move")}
+                >
+                  <span
+                    className="crop-handle crop-handle-edge crop-handle-top"
+                    onPointerDown={(event) => handleCropPointerDown(event, "top")}
+                  />
+                  <span
+                    className="crop-handle crop-handle-edge crop-handle-right"
+                    onPointerDown={(event) => handleCropPointerDown(event, "right")}
+                  />
+                  <span
+                    className="crop-handle crop-handle-edge crop-handle-bottom"
+                    onPointerDown={(event) => handleCropPointerDown(event, "bottom")}
+                  />
+                  <span
+                    className="crop-handle crop-handle-edge crop-handle-left"
+                    onPointerDown={(event) => handleCropPointerDown(event, "left")}
+                  />
+                  <span
+                    className="crop-handle crop-handle-corner crop-handle-top-left"
+                    onPointerDown={(event) => handleCropPointerDown(event, "top-left")}
+                  />
+                  <span
+                    className="crop-handle crop-handle-corner crop-handle-top-right"
+                    onPointerDown={(event) => handleCropPointerDown(event, "top-right")}
+                  />
+                  <span
+                    className="crop-handle crop-handle-corner crop-handle-bottom-left"
+                    onPointerDown={(event) => handleCropPointerDown(event, "bottom-left")}
+                  />
+                  <span
+                    className="crop-handle crop-handle-corner crop-handle-bottom-right"
+                    onPointerDown={(event) => handleCropPointerDown(event, "bottom-right")}
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="preview-empty">
+            <p>This browser does not support WebCodecs preview.</p>
+          </div>
+        )}
+        {isPreviewSupported && clips.length === 0 && (
+          <div className="preview-empty">
+            <p>Add videos to start editing.</p>
+          </div>
+        )}
+      </div>
+
+      <div className="preview-transport">
+        <button
+          className="button primary"
+          type="button"
+          onClick={() => void togglePlayPause()}
+          disabled={previewTimelineSegments.length === 0}
+        >
+          {isPlaying ? "Pause" : "Play"}
+        </button>
+        <div className="preview-readout-block">
+          <p className="timeline-readout">
+            {formatDuration(previewPositionSec)} / {formatDuration(previewDurationSec)}
           </p>
+          <p className="timeline-readout-sub">
+            Frame {currentPreviewFrame.toLocaleString()} / {totalPreviewFrames.toLocaleString()}
+            {isFrameReadoutEstimated ? " (auto fps)" : ""}
+          </p>
+        </div>
+        <div className="timeline-tools">
           <button
-            className="button secondary"
+            className={`button ghost tiny${timelineTool === "select" ? " active" : ""}`}
             type="button"
-            onClick={() => fileInputRef.current?.click()}
+            onClick={() => setTimelineTool("select")}
             disabled={isBusy}
           >
-            {isIngesting ? "Loading..." : "Browse Files"}
+            Pointer
           </button>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="video/*"
-            multiple
-            onChange={(event) => void handleFileInput(event)}
-            hidden
+          <button
+            className={`button ghost tiny${timelineTool === "razor" ? " active" : ""}`}
+            type="button"
+            onClick={() => setTimelineTool("razor")}
+            disabled={isBusy}
+          >
+            Razor
+          </button>
+          <button
+            className="button ghost tiny"
+            type="button"
+            onClick={removeSelectedTimelinePiece}
+            disabled={isBusy || !selectedTimelineItemId}
+          >
+            Delete Piece
+          </button>
+        </div>
+      </div>
+    </>
+  );
+
+  const timelineDockContent = timelineDurationSec <= 0 ? (
+    <p className="queue-empty">Load clips to edit the timeline.</p>
+  ) : (
+    <div className="timeline-visual">
+      <div
+        className="timeline-track-shell"
+        ref={trimRangeShellRef}
+      >
+        <div
+          className="timeline-mask timeline-mask-start"
+          style={{ width: `${trimStartPercent}%` }}
+        />
+        <div
+          className="timeline-mask timeline-mask-end"
+          style={{ width: `${trimRightPercent}%` }}
+        />
+
+        <div className={`timeline-track${timelineTool === "razor" ? " razor" : ""}`}>
+          {timelineDisplayItems.map((item) => {
+            const width = timelineDurationSec > 0 ? (item.duration / timelineDurationSec) * 100 : 0;
+            const clip = clipById.get(item.sourceClipId);
+            const clipFileName = clip?.file.name ?? "Unknown file";
+            const isSelected = item.id === selectedTimelineItemId;
+            const isDraggingItem = item.id === draggingTimelineItemId;
+
+            return (
+              <button
+                key={item.id}
+                className={`timeline-segment${isSelected ? " selected" : ""}${
+                  isDraggingItem ? " dragging" : ""
+                }`}
+                style={{ width: `${width}%` }}
+                type="button"
+                onClick={(event) => handleTimelineSegmentClick(event, item)}
+                onDragStart={(event) => handleTimelineItemDragStart(event, item.id)}
+                onDragOver={handleTimelineItemDragOver}
+                onDrop={(event) => handleTimelineItemDrop(event, item.id)}
+                onDragEnd={handleTimelineItemDragEnd}
+                draggable={!isBusy}
+                disabled={isBusy}
+                title={`File: ${clipFileName} · ${formatSecondsLabel(
+                  item.sourceStart
+                )} -> ${formatSecondsLabel(item.sourceEnd)} · ${formatSpeedLabel(item.speed)}x`}
+              >
+                <span className="timeline-segment-label">{clipFileName}</span>
+              </button>
+            );
+          })}
+        </div>
+
+        <div
+          className={`timeline-playhead${isDraggingPlayhead ? " dragging" : ""}`}
+          style={{ left: `${playheadPercent}%` }}
+          onPointerDown={handlePlayheadPointerDown}
+          title="Drag playhead"
+        />
+
+        <div
+          className={`trim-range-window${isDraggingTrimEdge ? " dragging" : ""}${
+            activeTrimEdge === "start"
+              ? " dragging-start"
+              : activeTrimEdge === "end"
+                ? " dragging-end"
+                : ""
+          }`}
+          style={{
+            left: `${trimStartPercent}%`,
+            right: `${trimRightPercent}%`
+          }}
+        >
+          <span
+            className="trim-window-edge trim-window-edge-start"
+            onPointerDown={(event) => handleTrimEdgePointerDown(event, "start")}
+            title="Drag trim start edge"
+          />
+          <span
+            className="trim-window-edge trim-window-edge-end"
+            onPointerDown={(event) => handleTrimEdgePointerDown(event, "end")}
+            title="Drag trim end edge"
           />
         </div>
-      </section>
+      </div>
 
-      {error && <p className="status error">{error}</p>}
+      <div className="trim-rail-values">
+        <span>In {formatSecondsLabel(trimStartSec)}</span>
+        <span>Out {formatSecondsLabel(trimEndSec)}</span>
+      </div>
+      <p className="hint">
+        Click pieces to seek. Use Razor to split. Drag pieces left/right to reorder.
+      </p>
+    </div>
+  );
 
-      <section className="queue-panel">
-        <div className="queue-header">
-          <p className="queue-title">Source Queue ({clips.length})</p>
+  const exportDockContent = (
+    <>
+      <div className="export-settings">
+        <p className="export-settings-title">Export Settings</p>
+        <div className="export-settings-grid">
+          <label>
+            Format
+            <select
+              className="time-input export-format-select"
+              value={exportFormat}
+              onChange={(event) => setExportFormat(event.target.value as ExportFormat)}
+              disabled={isBusy}
+            >
+              {EXPORT_FORMAT_OPTIONS.map((option) => (
+                <option
+                  key={option.value}
+                  value={option.value}
+                >
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label>
+            FPS
+            <input
+              className="time-input"
+              type="number"
+              min={1}
+              max={120}
+              step={1}
+              placeholder="Auto"
+              value={exportFpsInput}
+              onChange={(event) => setExportFpsInput(event.target.value)}
+              disabled={isBusy || !exportSupportsVideo}
+            />
+          </label>
+
+          <label>
+            Workspace Width
+            <input
+              className="time-input"
+              type="number"
+              min={2}
+              step={1}
+              placeholder="Auto"
+              value={exportWidthInput}
+              onChange={(event) => setExportWidthInput(event.target.value)}
+              disabled={isBusy || !exportSupportsVideo}
+            />
+          </label>
+
+          <label>
+            Workspace Height
+            <input
+              className="time-input"
+              type="number"
+              min={2}
+              step={1}
+              placeholder="Auto"
+              value={exportHeightInput}
+              onChange={(event) => setExportHeightInput(event.target.value)}
+              disabled={isBusy || !exportSupportsVideo}
+            />
+          </label>
+        </div>
+
+        <div className="export-settings-actions">
           <button
-            className="button ghost"
+            className="button ghost tiny"
             type="button"
-            onClick={clearQueue}
-            disabled={clips.length === 0 || isBusy}
+            onClick={() => {
+              if (largestClipResolution.area <= 0) {
+                return;
+              }
+              setExportWidthInput(String(largestClipResolution.width));
+              setExportHeightInput(String(largestClipResolution.height));
+            }}
+            disabled={isBusy || largestClipResolution.area <= 0 || !exportSupportsVideo}
           >
-            Clear Queue
+            Use Largest Source
+          </button>
+          <button
+            className="button ghost tiny"
+            type="button"
+            onClick={() => {
+              setExportWidthInput("");
+              setExportHeightInput("");
+            }}
+            disabled={isBusy || !exportSupportsVideo}
+          >
+            Auto Workspace
+          </button>
+          <button
+            className="button ghost tiny"
+            type="button"
+            onClick={() =>
+              setInspectorOpenState((previous) => ({
+                ...previous,
+                advancedExport: !previous.advancedExport
+              }))
+            }
+            disabled={isBusy}
+          >
+            {inspectorOpenState.advancedExport ? "Hide Advanced" : "Show Advanced"}
           </button>
         </div>
 
-        {clips.length === 0 ? (
-          <p className="queue-empty">No clips yet.</p>
-        ) : (
-          <ul className="queue-list">
-            {clips.map((clip, index) => (
-              <li
-                key={clip.id}
-                className="queue-item"
-              >
-                <div className="queue-select">
-                  <span className="queue-order">{index + 1}</span>
-                  <span className="queue-name">{clip.file.name}</span>
-                  <span className="queue-size">
-                    {formatDuration(clip.duration)} · {formatFileSize(clip.file.size)}
-                  </span>
-                </div>
-                <button
-                  className="button ghost tiny"
-                  type="button"
-                  onClick={() => removeClip(clip.id)}
-                  disabled={isBusy}
-                >
-                  Remove
-                </button>
-              </li>
-            ))}
-          </ul>
+        {inspectorOpenState.advancedExport && (
+          <div className="export-advanced">
+            <p className="export-settings-subtitle">Advanced</p>
+            <div className="toggle-row">
+              <label className={`toggle-item${disableVideoToggle ? " disabled" : ""}`}>
+                <input
+                  type="checkbox"
+                  checked={effectiveIncludeVideo}
+                  onChange={(event) => {
+                    const nextValue = event.target.checked;
+                    if (!nextValue && !effectiveIncludeAudio) {
+                      return;
+                    }
+                    setIncludeVideoInExport(nextValue);
+                  }}
+                  disabled={disableVideoToggle}
+                />
+                Include Video
+              </label>
+              <label className={`toggle-item${disableAudioToggle ? " disabled" : ""}`}>
+                <input
+                  type="checkbox"
+                  checked={effectiveIncludeAudio}
+                  onChange={(event) => {
+                    const nextValue = event.target.checked;
+                    if (!nextValue && !effectiveIncludeVideo) {
+                      return;
+                    }
+                    setIncludeAudioInExport(nextValue);
+                  }}
+                  disabled={disableAudioToggle}
+                />
+                Include Audio
+              </label>
+            </div>
+            <div className="export-settings-grid export-advanced-grid">
+              <label>
+                Video Bitrate (kbps)
+                <input
+                  className="time-input"
+                  type="number"
+                  min={100}
+                  max={200000}
+                  step={1}
+                  placeholder="Auto"
+                  value={exportVideoBitrateInput}
+                  onChange={(event) => setExportVideoBitrateInput(event.target.value)}
+                  disabled={isBusy || !effectiveIncludeVideo}
+                />
+              </label>
+              <label>
+                Audio Bitrate (kbps)
+                <input
+                  className="time-input"
+                  type="number"
+                  min={8}
+                  max={3200}
+                  step={1}
+                  placeholder="Auto"
+                  value={exportAudioBitrateInput}
+                  onChange={(event) => setExportAudioBitrateInput(event.target.value)}
+                  disabled={isBusy || !effectiveIncludeAudio}
+                />
+              </label>
+            </div>
+            <p className="hint">Leave bitrate empty to use codec defaults.</p>
+          </div>
         )}
-      </section>
 
-      <section className="preview-panel">
-        <div className="preview-frame">
-          {isPreviewSupported ? (
-            <div
-              ref={previewSurfaceRef}
-              className="preview-surface"
-            >
-              <canvas
-                ref={previewCanvasRef}
-                className="preview-canvas"
-              />
-              {clips.length > 0 && cropEnabled && (
-                <div
-                  className={`crop-overlay${isDraggingCrop ? " dragging" : ""}${
-                    isDraggingPreviewPan ? " panning" : ""
-                  }${selectedTimelineItem ? " has-pan" : ""}`}
-                >
-                  <div
-                    className="crop-mask-pane crop-mask-pane-top"
-                    style={{ top: "0%", left: "0%", width: "100%", height: `${cropRectPercent.top}%` }}
-                    onPointerDown={handlePreviewPanPointerDown}
-                  />
-                  <div
-                    className="crop-mask-pane crop-mask-pane-left"
-                    style={{
-                      top: `${cropRectPercent.top}%`,
-                      left: "0%",
-                      width: `${cropRectPercent.left}%`,
-                      height: `${cropRectPercent.height}%`
-                    }}
-                    onPointerDown={handlePreviewPanPointerDown}
-                  />
-                  <div
-                    className="crop-mask-pane crop-mask-pane-right"
-                    style={{
-                      top: `${cropRectPercent.top}%`,
-                      left: `${cropRectPercent.left + cropRectPercent.width}%`,
-                      width: `${cropMaskPercent.right}%`,
-                      height: `${cropRectPercent.height}%`
-                    }}
-                    onPointerDown={handlePreviewPanPointerDown}
-                  />
-                  <div
-                    className="crop-mask-pane crop-mask-pane-bottom"
-                    style={{
-                      top: `${cropRectPercent.top + cropRectPercent.height}%`,
-                      left: "0%",
-                      width: "100%",
-                      height: `${cropMaskPercent.bottom}%`
-                    }}
-                    onPointerDown={handlePreviewPanPointerDown}
-                  />
-                  <div
-                    className="crop-window"
-                    style={{
-                      left: `${cropRectPercent.left}%`,
-                      top: `${cropRectPercent.top}%`,
-                      width: `${cropRectPercent.width}%`,
-                      height: `${cropRectPercent.height}%`
-                    }}
-                    onPointerDown={(event) => handleCropPointerDown(event, "move")}
-                  >
-                    <span
-                      className="crop-handle crop-handle-edge crop-handle-top"
-                      onPointerDown={(event) => handleCropPointerDown(event, "top")}
-                    />
-                    <span
-                      className="crop-handle crop-handle-edge crop-handle-right"
-                      onPointerDown={(event) => handleCropPointerDown(event, "right")}
-                    />
-                    <span
-                      className="crop-handle crop-handle-edge crop-handle-bottom"
-                      onPointerDown={(event) => handleCropPointerDown(event, "bottom")}
-                    />
-                    <span
-                      className="crop-handle crop-handle-edge crop-handle-left"
-                      onPointerDown={(event) => handleCropPointerDown(event, "left")}
-                    />
-                    <span
-                      className="crop-handle crop-handle-corner crop-handle-top-left"
-                      onPointerDown={(event) => handleCropPointerDown(event, "top-left")}
-                    />
-                    <span
-                      className="crop-handle crop-handle-corner crop-handle-top-right"
-                      onPointerDown={(event) => handleCropPointerDown(event, "top-right")}
-                    />
-                    <span
-                      className="crop-handle crop-handle-corner crop-handle-bottom-left"
-                      onPointerDown={(event) => handleCropPointerDown(event, "bottom-left")}
-                    />
-                    <span
-                      className="crop-handle crop-handle-corner crop-handle-bottom-right"
-                      onPointerDown={(event) => handleCropPointerDown(event, "bottom-right")}
-                    />
-                  </div>
-                </div>
-              )}
-            </div>
-          ) : (
-            <div className="preview-empty">
-              <p>This browser does not support WebCodecs preview.</p>
-            </div>
-          )}
-          {isPreviewSupported && clips.length === 0 && (
-            <div className="preview-empty">
-              <p>Add videos to start editing.</p>
-            </div>
-          )}
+        <p className="hint">
+          Workspace auto uses the largest source clip ({autoResolutionLabel}). FPS auto keeps source timing.
+        </p>
+        {exportSupportsVideo && (
+          <p className="hint">
+            Crop coordinates use workspace pixels. Enabled crop outputs {normalizedCropRect.width} x{" "}
+            {normalizedCropRect.height}.
+          </p>
+        )}
+        {!exportSupportsVideo && (
+          <p className="hint">
+            This format is audio-only. Workspace, crop, and FPS settings are ignored.
+          </p>
+        )}
+        {!exportSupportsAudio && <p className="hint">This format does not support audio.</p>}
+      </div>
+
+      <div className="export-row">
+        <div className="export-mode">
+          <button
+            className={`button ghost tiny${exportMode === "fit" ? " active" : ""}`}
+            type="button"
+            onClick={() => setExportMode("fit")}
+            disabled={isBusy || !exportSupportsVideo}
+          >
+            Fit Canvas
+          </button>
+          <button
+            className={`button ghost tiny${exportMode === "fast" ? " active" : ""}`}
+            type="button"
+            onClick={() => setExportMode("fast")}
+            disabled={isBusy || !exportSupportsVideo}
+          >
+            Fast Copy
+          </button>
         </div>
-        <div className="crop-controls">
-          <div className="crop-controls-row">
-            <p className="crop-controls-title">Crop</p>
-            <label className={`toggle-item${clips.length === 0 ? " disabled" : ""}`}>
-              <input
-                type="checkbox"
-                checked={cropEnabled}
-                onChange={(event) => setCropEnabled(event.target.checked)}
+
+        <button
+          className="button primary"
+          type="button"
+          onClick={() => void handleExport()}
+          disabled={isBusy || editedSegments.length === 0}
+        >
+          {isExporting ? "Exporting..." : "Export Edited Video"}
+        </button>
+      </div>
+
+      <p className="hint">
+        {!exportSupportsVideo
+          ? "Audio-only formats ignore workspace and crop settings."
+          : exportMode === "fit"
+            ? "Fit Canvas keeps a consistent workspace frame."
+            : "Fast Copy is only available when no workspace, crop, transform, FPS, or speed changes are applied."}
+      </p>
+
+      {(isExporting || exportStage) && (
+        <div className="progress-block">
+          <p className="progress-label">
+            {exportStatusMessage ?? (exportStage ? exportStageLabel(exportStage) : "Working...")}
+          </p>
+          <div className="progress-bar">
+            <span
+              style={{
+                width: `${Math.round(Math.min(1, Math.max(0, exportProgress)) * 100)}%`
+              }}
+            />
+          </div>
+          <p className="progress-meta">
+            {exportProgressPercentText}
+            {exportFrameCountText ? ` · ${exportFrameCountText}` : ""}
+            {exportEtaText ? ` · ${exportEtaText}` : ""}
+          </p>
+        </div>
+      )}
+    </>
+  );
+
+  const previewDockContent = (
+    <section className="preview-dock-panel">
+      <div className="dock-tabs">
+        <button
+          className={`dock-tab${dockTab === "timeline" ? " active" : ""}`}
+          type="button"
+          onClick={() => setDockTab("timeline")}
+        >
+          Timeline
+        </button>
+        <button
+          className={`dock-tab${dockTab === "export" ? " active" : ""}`}
+          type="button"
+          onClick={() => setDockTab("export")}
+        >
+          Export
+        </button>
+      </div>
+      <div className="dock-content">{dockTab === "timeline" ? timelineDockContent : exportDockContent}</div>
+    </section>
+  );
+
+  const cropPanelContent = (
+    <section className="inspector-section">
+      <button
+        className="inspector-section-toggle"
+        type="button"
+        onClick={() =>
+          setInspectorOpenState((previous) => ({
+            ...previous,
+            crop: !previous.crop
+          }))
+        }
+      >
+        <span>Crop (Global)</span>
+        <span>{inspectorOpenState.crop ? "Hide" : "Show"}</span>
+      </button>
+      {inspectorOpenState.crop && (
+        <div className="inspector-section-body">
+          <div className="crop-controls">
+            <div className="crop-controls-row">
+              <label className={`toggle-item${clips.length === 0 ? " disabled" : ""}`}>
+                <input
+                  type="checkbox"
+                  checked={cropEnabled}
+                  onChange={(event) => setCropEnabled(event.target.checked)}
+                  disabled={isBusy || clips.length === 0 || !exportSupportsVideo}
+                />
+                Enable Crop
+              </label>
+              <button
+                className="button ghost tiny"
+                type="button"
+                onClick={resetCropRect}
                 disabled={isBusy || clips.length === 0 || !exportSupportsVideo}
+              >
+                Reset Crop
+              </button>
+            </div>
+            <div className="crop-controls-row">
+              <label className={`toggle-item${clips.length === 0 ? " disabled" : ""}`}>
+                <input
+                  type="checkbox"
+                  checked={cropLockAspect}
+                  onChange={(event) => {
+                    const nextChecked = event.target.checked;
+                    if (nextChecked && normalizedCropRect.height > 0) {
+                      setCropAspectRatio(normalizedCropRect.width / normalizedCropRect.height);
+                    }
+                    setCropLockAspect(nextChecked);
+                  }}
+                  disabled={isBusy || clips.length === 0 || !exportSupportsVideo}
+                />
+                Lock Aspect Ratio
+              </label>
+            </div>
+            <div className="crop-input-grid">
+              <label>
+                X
+                <input
+                  className="time-input"
+                  type="number"
+                  step={1}
+                  min={0}
+                  value={normalizedCropRect.x}
+                  onChange={(event) => setCropField("x", event.target.value)}
+                  disabled={isBusy || clips.length === 0 || !exportSupportsVideo}
+                />
+              </label>
+              <label>
+                Y
+                <input
+                  className="time-input"
+                  type="number"
+                  step={1}
+                  min={0}
+                  value={normalizedCropRect.y}
+                  onChange={(event) => setCropField("y", event.target.value)}
+                  disabled={isBusy || clips.length === 0 || !exportSupportsVideo}
+                />
+              </label>
+              <label>
+                W
+                <input
+                  className="time-input"
+                  type="number"
+                  step={1}
+                  min={MIN_CROP_SIZE_PX}
+                  value={normalizedCropRect.width}
+                  onChange={(event) => setCropField("width", event.target.value)}
+                  disabled={isBusy || clips.length === 0 || !exportSupportsVideo}
+                />
+              </label>
+              <label>
+                H
+                <input
+                  className="time-input"
+                  type="number"
+                  step={1}
+                  min={MIN_CROP_SIZE_PX}
+                  value={normalizedCropRect.height}
+                  onChange={(event) => setCropField("height", event.target.value)}
+                  disabled={isBusy || clips.length === 0 || !exportSupportsVideo}
+                />
+              </label>
+            </div>
+            <p className="hint">
+              Drag the shaded mask around the preview to pan selected content. Hold Shift to bypass snapping.
+            </p>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+
+  const inspectorContent = (
+    <div className="inspector-stack">
+      {selectedTimelineItem ? (
+        <section className="inspector-section">
+          <button
+            className="inspector-section-toggle"
+            type="button"
+            onClick={() =>
+              setInspectorOpenState((previous) => ({
+                ...previous,
+                segment: !previous.segment
+              }))
+            }
+          >
+            <span>Selected Segment</span>
+            <span>{inspectorOpenState.segment ? "Hide" : "Show"}</span>
+          </button>
+
+          {inspectorOpenState.segment && (
+            <div className="inspector-section-body">
+              <p className="hint">
+                {clipById.get(selectedTimelineItem.sourceClipId)?.file.name ?? "Unknown"} ·{" "}
+                {formatSecondsLabel(selectedTimelineItem.sourceStart)} -{" "}
+                {formatSecondsLabel(selectedTimelineItem.sourceEnd)}
+              </p>
+
+              <div className="inspector-subsection">
+                <button
+                  className="inspector-subsection-toggle"
+                  type="button"
+                  onClick={() =>
+                    setInspectorOpenState((previous) => ({
+                      ...previous,
+                      speed: !previous.speed
+                    }))
+                  }
+                >
+                  <span>Speed + Duration</span>
+                  <span>{inspectorOpenState.speed ? "Hide" : "Show"}</span>
+                </button>
+
+                {inspectorOpenState.speed && (
+                  <div className="inspector-subsection-body">
+                    <div className="piece-speed-header">
+                      <span>Speed</span>
+                      <strong>{formatSpeedLabel(selectedTimelineItem.speed)}x</strong>
+                    </div>
+                    <label className="piece-speed-input-row">
+                      <span>Precise value</span>
+                      <div className="piece-speed-input-wrap">
+                        <input
+                          className="time-input piece-speed-input"
+                          type="number"
+                          min={MIN_SEGMENT_SPEED}
+                          max={MAX_SEGMENT_SPEED}
+                          step="any"
+                          value={selectedSpeedInput}
+                          onChange={(event) => handleSelectedSpeedInputChange(event.target.value)}
+                          onBlur={commitSelectedSpeedInput}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter") {
+                              event.preventDefault();
+                              commitSelectedSpeedInput();
+                              (event.currentTarget as HTMLInputElement).blur();
+                            }
+                          }}
+                          disabled={isBusy}
+                          aria-label="Selected piece speed input"
+                        />
+                        <span>x</span>
+                      </div>
+                    </label>
+                    <input
+                      className="piece-speed-slider"
+                      type="range"
+                      min={MIN_SEGMENT_SPEED_LOG}
+                      max={MAX_SEGMENT_SPEED_LOG}
+                      step={0.01}
+                      value={selectedSpeedSliderValue}
+                      onChange={(event) =>
+                        setSelectedTimelineSpeed(logSliderValueToSpeed(Number(event.target.value)))
+                      }
+                      disabled={isBusy}
+                      aria-label="Selected piece speed"
+                    />
+                    <div className="piece-speed-scale">
+                      <span>{formatSpeedLabel(MIN_SEGMENT_SPEED)}x</span>
+                      <span>1x</span>
+                      <span>{formatSpeedLabel(MAX_SEGMENT_SPEED)}x</span>
+                    </div>
+                    <div className="duration-input-grid">
+                      <label>
+                        Min
+                        <input
+                          className="time-input"
+                          type="number"
+                          min={0}
+                          step={1}
+                          value={selectedDurationMinutesInput}
+                          onChange={(event) =>
+                            handleSelectedDurationInputChange("minutes", event.target.value)
+                          }
+                          onBlur={commitSelectedDurationInput}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter") {
+                              event.preventDefault();
+                              commitSelectedDurationInput();
+                              (event.currentTarget as HTMLInputElement).blur();
+                            }
+                          }}
+                          disabled={isBusy}
+                          aria-label="Selected piece duration minutes"
+                        />
+                      </label>
+                      <label>
+                        Sec
+                        <input
+                          className="time-input"
+                          type="number"
+                          min={0}
+                          step={1}
+                          value={selectedDurationSecondsInput}
+                          onChange={(event) =>
+                            handleSelectedDurationInputChange("seconds", event.target.value)
+                          }
+                          onBlur={commitSelectedDurationInput}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter") {
+                              event.preventDefault();
+                              commitSelectedDurationInput();
+                              (event.currentTarget as HTMLInputElement).blur();
+                            }
+                          }}
+                          disabled={isBusy}
+                          aria-label="Selected piece duration seconds"
+                        />
+                      </label>
+                      <label>
+                        Ms
+                        <input
+                          className="time-input"
+                          type="number"
+                          min={0}
+                          step={1}
+                          value={selectedDurationMillisecondsInput}
+                          onChange={(event) =>
+                            handleSelectedDurationInputChange("milliseconds", event.target.value)
+                          }
+                          onBlur={commitSelectedDurationInput}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter") {
+                              event.preventDefault();
+                              commitSelectedDurationInput();
+                              (event.currentTarget as HTMLInputElement).blur();
+                            }
+                          }}
+                          disabled={isBusy}
+                          aria-label="Selected piece duration milliseconds"
+                        />
+                      </label>
+                    </div>
+                    <div className="piece-speed-presets">
+                      {[0.01, 0.1, 0.5, 1, 2, 10, 100].map((preset) => (
+                        <button
+                          key={preset}
+                          className={`button ghost tiny${
+                            Math.abs(selectedTimelineItem.speed - preset) <=
+                            Math.max(0.00001, preset * 0.01)
+                              ? " active"
+                              : ""
+                          }`}
+                          type="button"
+                          onClick={() => setSelectedTimelineSpeed(preset)}
+                          disabled={isBusy}
+                        >
+                          {formatSpeedLabel(preset)}x
+                        </button>
+                      ))}
+                    </div>
+                    <div className="trim-rail-values">
+                      <span>
+                        Source{" "}
+                        {formatSecondsLabel(
+                          Math.max(0, selectedTimelineItem.sourceEnd - selectedTimelineItem.sourceStart)
+                        )}
+                      </span>
+                      <span>Timeline {formatSecondsLabel(selectedTimelineItem.duration)}</span>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="inspector-subsection">
+                <button
+                  className="inspector-subsection-toggle"
+                  type="button"
+                  onClick={() =>
+                    setInspectorOpenState((previous) => ({
+                      ...previous,
+                      transform: !previous.transform
+                    }))
+                  }
+                >
+                  <span>Transform</span>
+                  <span>{inspectorOpenState.transform ? "Hide" : "Show"}</span>
+                </button>
+
+                {inspectorOpenState.transform && (
+                  <div className="inspector-subsection-body">
+                    <div className="piece-speed-header">
+                      <span>Scale</span>
+                      <strong>{formatScaleLabel(selectedTimelineItem.scale)}x</strong>
+                    </div>
+                    <label className="piece-speed-input-row">
+                      <span>Scale</span>
+                      <div className="piece-speed-input-wrap">
+                        <input
+                          className="time-input piece-speed-input"
+                          type="number"
+                          min={MIN_PIECE_SCALE}
+                          max={MAX_PIECE_SCALE}
+                          step="any"
+                          value={selectedScaleInput}
+                          onChange={(event) => handleSelectedScaleInputChange(event.target.value)}
+                          onBlur={commitSelectedScaleInput}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter") {
+                              event.preventDefault();
+                              commitSelectedScaleInput();
+                              (event.currentTarget as HTMLInputElement).blur();
+                            }
+                          }}
+                          disabled={isBusy}
+                          aria-label="Selected piece scale input"
+                        />
+                        <span>x</span>
+                      </div>
+                    </label>
+                    <input
+                      className="piece-speed-slider"
+                      type="range"
+                      min={MIN_PIECE_SCALE_LOG}
+                      max={MAX_PIECE_SCALE_LOG}
+                      step={0.01}
+                      value={selectedScaleSliderValue}
+                      onChange={(event) =>
+                        setSelectedTimelineTransform({
+                          scale: logSliderValueToScale(Number(event.target.value))
+                        })
+                      }
+                      disabled={isBusy}
+                      aria-label="Selected piece scale"
+                    />
+                    <div className="piece-speed-scale">
+                      <span>{formatScaleLabel(MIN_PIECE_SCALE)}x</span>
+                      <span>1x</span>
+                      <span>{formatScaleLabel(MAX_PIECE_SCALE)}x</span>
+                    </div>
+                    <label className="piece-speed-input-row">
+                      <span>Pan X</span>
+                      <div className="piece-speed-input-wrap">
+                        <input
+                          className="time-input piece-speed-input"
+                          type="number"
+                          step="any"
+                          value={selectedPanXInput}
+                          onChange={(event) => handleSelectedPanInputChange("x", event.target.value)}
+                          onBlur={() => commitSelectedPanInput("x")}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter") {
+                              event.preventDefault();
+                              commitSelectedPanInput("x");
+                              (event.currentTarget as HTMLInputElement).blur();
+                            }
+                          }}
+                          disabled={isBusy}
+                          aria-label="Selected piece pan X input"
+                        />
+                        <span>px</span>
+                      </div>
+                    </label>
+                    <label className="piece-speed-input-row">
+                      <span>Pan Y</span>
+                      <div className="piece-speed-input-wrap">
+                        <input
+                          className="time-input piece-speed-input"
+                          type="number"
+                          step="any"
+                          value={selectedPanYInput}
+                          onChange={(event) => handleSelectedPanInputChange("y", event.target.value)}
+                          onBlur={() => commitSelectedPanInput("y")}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter") {
+                              event.preventDefault();
+                              commitSelectedPanInput("y");
+                              (event.currentTarget as HTMLInputElement).blur();
+                            }
+                          }}
+                          disabled={isBusy}
+                          aria-label="Selected piece pan Y input"
+                        />
+                        <span>px</span>
+                      </div>
+                    </label>
+                    <div className="piece-speed-presets">
+                      <button
+                        className="button ghost tiny"
+                        type="button"
+                        onClick={fillSelectedPieceToCrop}
+                        disabled={isBusy}
+                      >
+                        Fill Crop
+                      </button>
+                      <button
+                        className="button ghost tiny"
+                        type="button"
+                        onClick={resetSelectedTransform}
+                        disabled={isBusy}
+                      >
+                        Reset Transform
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </section>
+      ) : (
+        <p className="queue-empty">Select a timeline piece to edit speed and transform.</p>
+      )}
+
+      <section className="inspector-section">
+        <div className="inspector-section-static-title">Workspace / Playback</div>
+        <div className="inspector-section-body">
+          <div className="input-grid-4">
+            <label>
+              Format
+              <select
+                className="time-input export-format-select"
+                value={exportFormat}
+                onChange={(event) => setExportFormat(event.target.value as ExportFormat)}
+                disabled={isBusy}
+              >
+                {EXPORT_FORMAT_OPTIONS.map((option) => (
+                  <option
+                    key={option.value}
+                    value={option.value}
+                  >
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              FPS
+              <input
+                className="time-input"
+                type="number"
+                min={1}
+                max={120}
+                step={1}
+                placeholder="Auto"
+                value={exportFpsInput}
+                onChange={(event) => setExportFpsInput(event.target.value)}
+                disabled={isBusy || !exportSupportsVideo}
               />
-              Enable Crop
+            </label>
+            <label>
+              Workspace Width
+              <input
+                className="time-input"
+                type="number"
+                min={2}
+                step={1}
+                placeholder="Auto"
+                value={exportWidthInput}
+                onChange={(event) => setExportWidthInput(event.target.value)}
+                disabled={isBusy || !exportSupportsVideo}
+              />
+            </label>
+            <label>
+              Workspace Height
+              <input
+                className="time-input"
+                type="number"
+                min={2}
+                step={1}
+                placeholder="Auto"
+                value={exportHeightInput}
+                onChange={(event) => setExportHeightInput(event.target.value)}
+                disabled={isBusy || !exportSupportsVideo}
+              />
             </label>
           </div>
-          <div className="crop-controls-row">
-            <label className={`toggle-item${clips.length === 0 ? " disabled" : ""}`}>
-              <input
-                type="checkbox"
-                checked={cropLockAspect}
-                onChange={(event) => {
-                  const nextChecked = event.target.checked;
-                  if (nextChecked && normalizedCropRect.height > 0) {
-                    setCropAspectRatio(normalizedCropRect.width / normalizedCropRect.height);
-                  }
-                  setCropLockAspect(nextChecked);
-                }}
-                disabled={isBusy || clips.length === 0 || !exportSupportsVideo}
-              />
-              Lock Aspect Ratio
-            </label>
+          <div className="piece-speed-presets">
             <button
               className="button ghost tiny"
               type="button"
-              onClick={resetCropRect}
-              disabled={isBusy || clips.length === 0 || !exportSupportsVideo}
+              onClick={() => {
+                if (largestClipResolution.area <= 0) {
+                  return;
+                }
+                setExportWidthInput(String(largestClipResolution.width));
+                setExportHeightInput(String(largestClipResolution.height));
+              }}
+              disabled={isBusy || largestClipResolution.area <= 0 || !exportSupportsVideo}
             >
-              Reset Crop
+              Use Largest Source
+            </button>
+            <button
+              className="button ghost tiny"
+              type="button"
+              onClick={() => {
+                setExportWidthInput("");
+                setExportHeightInput("");
+              }}
+              disabled={isBusy || !exportSupportsVideo}
+            >
+              Auto Workspace
             </button>
           </div>
-          <div className="crop-input-grid">
-            <label>
-              X
-              <input
-                className="time-input"
-                type="number"
-                step={1}
-                min={0}
-                value={normalizedCropRect.x}
-                onChange={(event) => setCropField("x", event.target.value)}
-                disabled={isBusy || clips.length === 0 || !exportSupportsVideo}
-              />
-            </label>
-            <label>
-              Y
-              <input
-                className="time-input"
-                type="number"
-                step={1}
-                min={0}
-                value={normalizedCropRect.y}
-                onChange={(event) => setCropField("y", event.target.value)}
-                disabled={isBusy || clips.length === 0 || !exportSupportsVideo}
-              />
-            </label>
-            <label>
-              W
-              <input
-                className="time-input"
-                type="number"
-                step={1}
-                min={MIN_CROP_SIZE_PX}
-                value={normalizedCropRect.width}
-                onChange={(event) => setCropField("width", event.target.value)}
-                disabled={isBusy || clips.length === 0 || !exportSupportsVideo}
-              />
-            </label>
-            <label>
-              H
-              <input
-                className="time-input"
-                type="number"
-                step={1}
-                min={MIN_CROP_SIZE_PX}
-                value={normalizedCropRect.height}
-                onChange={(event) => setCropField("height", event.target.value)}
-                disabled={isBusy || clips.length === 0 || !exportSupportsVideo}
-              />
-            </label>
-          </div>
-          <p className="hint">
-            Crop uses workspace pixels. Crop overlay is preview-only; the full frame remains visible in playback.
-          </p>
-          <p className="hint">
-            Mixed source sizes can show black areas until piece scale/pan is adjusted (for example with Fill Crop).
-          </p>
-          <p className="hint">
-            Tip: drag the shaded area outside the crop window to pan. Hold Shift while dragging to disable snapping.
-          </p>
         </div>
-        {selectedTimelineItem ? (
-          <div className="piece-speed-panel preview-transform-panel">
-            <p className="hint">
-              Selected piece: {clipById.get(selectedTimelineItem.sourceClipId)?.file.name ?? "Unknown"} ·{" "}
-              {formatSecondsLabel(selectedTimelineItem.sourceStart)} -{" "}
-              {formatSecondsLabel(selectedTimelineItem.sourceEnd)}
-            </p>
-            <div className="piece-speed-header">
-              <span>Transform</span>
-              <strong>{formatScaleLabel(selectedTimelineItem.scale)}x</strong>
-            </div>
-            <label className="piece-speed-input-row">
-              <span>Scale</span>
-              <div className="piece-speed-input-wrap">
-                <input
-                  className="time-input piece-speed-input"
-                  type="number"
-                  min={MIN_PIECE_SCALE}
-                  max={MAX_PIECE_SCALE}
-                  step="any"
-                  value={selectedScaleInput}
-                  onChange={(event) => handleSelectedScaleInputChange(event.target.value)}
-                  onBlur={commitSelectedScaleInput}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") {
-                      event.preventDefault();
-                      commitSelectedScaleInput();
-                      (event.currentTarget as HTMLInputElement).blur();
-                    }
-                  }}
-                  disabled={isBusy}
-                  aria-label="Selected piece scale input"
-                />
-                <span>x</span>
-              </div>
-            </label>
-            <input
-              className="piece-speed-slider"
-              type="range"
-              min={MIN_PIECE_SCALE_LOG}
-              max={MAX_PIECE_SCALE_LOG}
-              step={0.01}
-              value={selectedScaleSliderValue}
-              onChange={(event) =>
-                setSelectedTimelineTransform({
-                  scale: logSliderValueToScale(Number(event.target.value))
-                })
-              }
-              disabled={isBusy}
-              aria-label="Selected piece scale"
-            />
-            <div className="piece-speed-scale">
-              <span>{formatScaleLabel(MIN_PIECE_SCALE)}x</span>
-              <span>1x</span>
-              <span>{formatScaleLabel(MAX_PIECE_SCALE)}x</span>
-            </div>
-            <p className="hint">Log slider: 1x is centered. Values below 1 zoom out.</p>
-            <label className="piece-speed-input-row">
-              <span>Pan X</span>
-              <div className="piece-speed-input-wrap">
-                <input
-                  className="time-input piece-speed-input"
-                  type="number"
-                  step="any"
-                  value={selectedPanXInput}
-                  onChange={(event) => handleSelectedPanInputChange("x", event.target.value)}
-                  onBlur={() => commitSelectedPanInput("x")}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") {
-                      event.preventDefault();
-                      commitSelectedPanInput("x");
-                      (event.currentTarget as HTMLInputElement).blur();
-                    }
-                  }}
-                  disabled={isBusy}
-                  aria-label="Selected piece pan X input"
-                />
-                <span>px</span>
-              </div>
-            </label>
-            <label className="piece-speed-input-row">
-              <span>Pan Y</span>
-              <div className="piece-speed-input-wrap">
-                <input
-                  className="time-input piece-speed-input"
-                  type="number"
-                  step="any"
-                  value={selectedPanYInput}
-                  onChange={(event) => handleSelectedPanInputChange("y", event.target.value)}
-                  onBlur={() => commitSelectedPanInput("y")}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") {
-                      event.preventDefault();
-                      commitSelectedPanInput("y");
-                      (event.currentTarget as HTMLInputElement).blur();
-                    }
-                  }}
-                  disabled={isBusy}
-                  aria-label="Selected piece pan Y input"
-                />
-                <span>px</span>
-              </div>
-            </label>
-            <div className="piece-speed-presets">
-              <button
-                className="button ghost tiny"
-                type="button"
-                onClick={fillSelectedPieceToCrop}
-                disabled={isBusy}
-              >
-                Fill Crop
-              </button>
-              <button
-                className="button ghost tiny"
-                type="button"
-                onClick={resetSelectedTransform}
-                disabled={isBusy}
-              >
-                Reset Transform
-              </button>
-            </div>
-            <p className="hint">Transform is live on the selected piece in preview and always applied on export.</p>
-          </div>
-        ) : (
-          clips.length > 0 && (
-            <p className="hint">
-              Select a timeline piece to edit Scale/Pan directly next to the preview.
-            </p>
-          )
-        )}
+      </section>
+    </div>
+  );
+
+  return (
+    <main className="app-shell">
+      {error && <p className="status error">{error}</p>}
+
+      <section className="workspace-panel top-media-panel">
+        {mediaBinContent}
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="video/*"
+          multiple
+          onChange={(event) => void handleFileInput(event)}
+          hidden
+        />
       </section>
 
-      <section className="edit-panel">
-        <p className="queue-title">Timeline Controls</p>
+      <div
+        className={`workspace-shell${isDesktopViewport ? " desktop" : " stacked"}`}
+        style={workstationStyle}
+      >
+        {isDesktopViewport ? (
+          <>
+            <aside className={`workspace-panel left-tools-panel${isLeftPanelCollapsed ? " collapsed" : ""}`}>
+              {isLeftPanelCollapsed ? (
+                <button
+                  className="panel-edge-tab panel-edge-tab-left"
+                  type="button"
+                  onClick={() => setIsLeftPanelCollapsed(false)}
+                  aria-label="Open crop panel"
+                >
+                  Crop
+                </button>
+              ) : (
+                <>
+                  <div className="side-panel-header">
+                    <button
+                      className="button ghost tiny panel-collapse-trigger"
+                      type="button"
+                      onClick={() => setIsLeftPanelCollapsed(true)}
+                    >
+                      Hide Panel
+                    </button>
+                  </div>
+                  {cropPanelContent}
+                </>
+              )}
+            </aside>
+            {!isLeftPanelCollapsed && (
+              <div
+                className={`workspace-splitter vertical splitter-left${
+                  activeSplitter === "left" ? " active" : ""
+                }`}
+                onPointerDown={(event) => handleSplitterPointerDown(event, "left")}
+                onDoubleClick={() => resetSplitterSize("left")}
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="Resize crop panel"
+              />
+            )}
 
-        {timelineDurationSec <= 0 ? (
-          <p className="queue-empty">Load clips to edit the timeline.</p>
+            <section className="workspace-panel preview-stage-panel">
+              {previewStageContent}
+              {previewDockContent}
+            </section>
+            {!isRightPanelCollapsed && (
+              <div
+                className={`workspace-splitter vertical splitter-right${
+                  activeSplitter === "right" ? " active" : ""
+                }`}
+                onPointerDown={(event) => handleSplitterPointerDown(event, "right")}
+                onDoubleClick={() => resetSplitterSize("right")}
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="Resize inspector panel"
+              />
+            )}
+
+            <aside className={`workspace-panel inspector-panel${isRightPanelCollapsed ? " collapsed" : ""}`}>
+              {isRightPanelCollapsed ? (
+                <button
+                  className="panel-edge-tab panel-edge-tab-right"
+                  type="button"
+                  onClick={() => setIsRightPanelCollapsed(false)}
+                  aria-label="Open inspector panel"
+                >
+                  Inspector
+                </button>
+              ) : (
+                <>
+                  <div className="side-panel-header side-panel-header-right">
+                    <button
+                      className="button ghost tiny panel-collapse-trigger"
+                      type="button"
+                      onClick={() => setIsRightPanelCollapsed(true)}
+                    >
+                      Hide Panel
+                    </button>
+                  </div>
+                  {inspectorContent}
+                </>
+              )}
+            </aside>
+          </>
         ) : (
           <>
-            <div className="timeline-toolbar">
+            <section className="workspace-panel preview-stage-panel">
+              {previewStageContent}
+              {previewDockContent}
+            </section>
+            <div className="utility-tabs">
               <button
-                className="button primary"
+                className={`dock-tab${utilityTab === "inspector" ? " active" : ""}`}
                 type="button"
-                onClick={() => void togglePlayPause()}
-                disabled={previewTimelineSegments.length === 0}
+                onClick={() => setUtilityTab("inspector")}
               >
-                {isPlaying ? "Pause" : "Play"}
+                Inspector
               </button>
-
-              <p className="timeline-readout">
-                {formatDuration(previewPositionSec)} / {formatDuration(previewDurationSec)}
-              </p>
-              <p className="timeline-readout-sub">
-                Frame {currentPreviewFrame.toLocaleString()} / {totalPreviewFrames.toLocaleString()}
-                {isFrameReadoutEstimated ? " (auto fps)" : ""}
-              </p>
-
-              <div className="timeline-tools">
-                <button
-                  className={`button ghost tiny${timelineTool === "select" ? " active" : ""}`}
-                  type="button"
-                  onClick={() => setTimelineTool("select")}
-                  disabled={isBusy}
-                >
-                  Pointer
-                </button>
-                <button
-                  className={`button ghost tiny${timelineTool === "razor" ? " active" : ""}`}
-                  type="button"
-                  onClick={() => setTimelineTool("razor")}
-                  disabled={isBusy}
-                >
-                  Razor
-                </button>
-                <button
-                  className="button ghost tiny"
-                  type="button"
-                  onClick={removeSelectedTimelinePiece}
-                  disabled={isBusy || !selectedTimelineItemId}
-                >
-                  Delete Piece
-                </button>
-              </div>
-            </div>
-
-            <div className="timeline-visual">
-              <div
-                className="timeline-track-shell"
-                ref={trimRangeShellRef}
-              >
-                <div
-                  className="timeline-mask timeline-mask-start"
-                  style={{ width: `${trimStartPercent}%` }}
-                />
-                <div
-                  className="timeline-mask timeline-mask-end"
-                  style={{ width: `${trimRightPercent}%` }}
-                />
-
-                <div className={`timeline-track${timelineTool === "razor" ? " razor" : ""}`}>
-                  {timelineDisplayItems.map((item) => {
-                    const width =
-                      timelineDurationSec > 0 ? (item.duration / timelineDurationSec) * 100 : 0;
-                    const clip = clipById.get(item.sourceClipId);
-                    const clipFileName = clip?.file.name ?? "Unknown file";
-                    const isSelected = item.id === selectedTimelineItemId;
-                    const isDraggingItem = item.id === draggingTimelineItemId;
-
-                    return (
-                      <button
-                        key={item.id}
-                        className={`timeline-segment${isSelected ? " selected" : ""}${
-                          isDraggingItem ? " dragging" : ""
-                        }`}
-                        style={{ width: `${width}%` }}
-                        type="button"
-                        onClick={(event) => handleTimelineSegmentClick(event, item)}
-                        onDragStart={(event) => handleTimelineItemDragStart(event, item.id)}
-                        onDragOver={handleTimelineItemDragOver}
-                        onDrop={(event) => handleTimelineItemDrop(event, item.id)}
-                        onDragEnd={handleTimelineItemDragEnd}
-                        draggable={!isBusy}
-                        disabled={isBusy}
-                        title={`File: ${clipFileName} · ${formatSecondsLabel(
-                          item.sourceStart
-                        )} -> ${formatSecondsLabel(item.sourceEnd)} · ${formatSpeedLabel(item.speed)}x`}
-                      >
-                        <span className="timeline-segment-label">{clipFileName}</span>
-                      </button>
-                    );
-                  })}
-                </div>
-
-                <div
-                  className={`timeline-playhead${isDraggingPlayhead ? " dragging" : ""}`}
-                  style={{ left: `${playheadPercent}%` }}
-                  onPointerDown={handlePlayheadPointerDown}
-                  title="Drag playhead"
-                />
-
-                <div
-                  className={`trim-range-window${isDraggingTrimEdge ? " dragging" : ""}${
-                    activeTrimEdge === "start"
-                      ? " dragging-start"
-                      : activeTrimEdge === "end"
-                        ? " dragging-end"
-                        : ""
-                  }`}
-                  style={{
-                    left: `${trimStartPercent}%`,
-                    right: `${trimRightPercent}%`
-                  }}
-                >
-                  <span
-                    className="trim-window-edge trim-window-edge-start"
-                    onPointerDown={(event) => handleTrimEdgePointerDown(event, "start")}
-                    title="Drag trim start edge"
-                  />
-                  <span
-                    className="trim-window-edge trim-window-edge-end"
-                    onPointerDown={(event) => handleTrimEdgePointerDown(event, "end")}
-                    title="Drag trim end edge"
-                  />
-                </div>
-              </div>
-
-              <div className="trim-rail-values">
-                <span>In {formatSecondsLabel(trimStartSec)}</span>
-                <span>Out {formatSecondsLabel(trimEndSec)}</span>
-              </div>
-
-              {selectedTimelineItem ? (
-                <div className="piece-speed-panel">
-                  <p className="hint">
-                    Selected piece: {clipById.get(selectedTimelineItem.sourceClipId)?.file.name ?? "Unknown"} ·{" "}
-                    {formatSecondsLabel(selectedTimelineItem.sourceStart)} - {formatSecondsLabel(selectedTimelineItem.sourceEnd)}
-                  </p>
-                  <div className="piece-speed-header">
-                    <span>Speed</span>
-                    <strong>{formatSpeedLabel(selectedTimelineItem.speed)}x</strong>
-                  </div>
-                  <label className="piece-speed-input-row">
-                    <span>Precise value</span>
-                    <div className="piece-speed-input-wrap">
-                      <input
-                        className="time-input piece-speed-input"
-                        type="number"
-                        min={MIN_SEGMENT_SPEED}
-                        max={MAX_SEGMENT_SPEED}
-                        step="any"
-                        value={selectedSpeedInput}
-                        onChange={(event) => handleSelectedSpeedInputChange(event.target.value)}
-                        onBlur={commitSelectedSpeedInput}
-                        onKeyDown={(event) => {
-                          if (event.key === "Enter") {
-                            event.preventDefault();
-                            commitSelectedSpeedInput();
-                            (event.currentTarget as HTMLInputElement).blur();
-                          }
-                        }}
-                        disabled={isBusy}
-                        aria-label="Selected piece speed input"
-                      />
-                      <span>x</span>
-                    </div>
-                  </label>
-                  <input
-                    className="piece-speed-slider"
-                    type="range"
-                    min={MIN_SEGMENT_SPEED_LOG}
-                    max={MAX_SEGMENT_SPEED_LOG}
-                    step={0.01}
-                    value={selectedSpeedSliderValue}
-                    onChange={(event) =>
-                      setSelectedTimelineSpeed(logSliderValueToSpeed(Number(event.target.value)))
-                    }
-                    disabled={isBusy}
-                    aria-label="Selected piece speed"
-                  />
-                  <div className="piece-speed-scale">
-                    <span>{formatSpeedLabel(MIN_SEGMENT_SPEED)}x</span>
-                    <span>1x</span>
-                    <span>{formatSpeedLabel(MAX_SEGMENT_SPEED)}x</span>
-                  </div>
-                  <p className="hint">Log slider: 1x is centered.</p>
-                  <p className="hint">Preview uses a custom WebCodecs + Canvas engine.</p>
-                  <div className="piece-speed-presets">
-                    {[0.01, 0.1, 0.5, 1, 2, 10, 100].map((preset) => (
-                      <button
-                        key={preset}
-                        className={`button ghost tiny${
-                          Math.abs(selectedTimelineItem.speed - preset) <=
-                          Math.max(0.00001, preset * 0.01)
-                            ? " active"
-                            : ""
-                        }`}
-                        type="button"
-                        onClick={() => setSelectedTimelineSpeed(preset)}
-                        disabled={isBusy}
-                      >
-                        {formatSpeedLabel(preset)}x
-                      </button>
-                    ))}
-                  </div>
-                  <div className="trim-rail-values">
-                    <span>
-                      Source{" "}
-                      {formatSecondsLabel(
-                        Math.max(0, selectedTimelineItem.sourceEnd - selectedTimelineItem.sourceStart)
-                      )}
-                    </span>
-                    <span>Timeline {formatSecondsLabel(selectedTimelineItem.duration)}</span>
-                  </div>
-                </div>
-              ) : (
-                <p className="hint">
-                  Click pieces to seek. Use Razor to split. Drag pieces left/right to reorder.
-                </p>
-              )}
-            </div>
-
-            <div className="export-settings">
-              <p className="export-settings-title">Export Settings</p>
-              <div className="export-settings-grid">
-                <label>
-                  Format
-                  <select
-                    className="time-input export-format-select"
-                    value={exportFormat}
-                    onChange={(event) => setExportFormat(event.target.value as ExportFormat)}
-                    disabled={isBusy}
-                  >
-                    {EXPORT_FORMAT_OPTIONS.map((option) => (
-                      <option
-                        key={option.value}
-                        value={option.value}
-                      >
-                        {option.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-
-                <label>
-                  FPS
-                  <input
-                    className="time-input"
-                    type="number"
-                    min={1}
-                    max={120}
-                    step={1}
-                    placeholder="Auto"
-                    value={exportFpsInput}
-                    onChange={(event) => setExportFpsInput(event.target.value)}
-                    disabled={isBusy || !exportSupportsVideo}
-                  />
-                </label>
-
-                <label>
-                  Workspace Width
-                  <input
-                    className="time-input"
-                    type="number"
-                    min={2}
-                    step={1}
-                    placeholder="Auto"
-                    value={exportWidthInput}
-                    onChange={(event) => setExportWidthInput(event.target.value)}
-                    disabled={isBusy || !exportSupportsVideo}
-                  />
-                </label>
-
-                <label>
-                  Workspace Height
-                  <input
-                    className="time-input"
-                    type="number"
-                    min={2}
-                    step={1}
-                    placeholder="Auto"
-                    value={exportHeightInput}
-                    onChange={(event) => setExportHeightInput(event.target.value)}
-                    disabled={isBusy || !exportSupportsVideo}
-                  />
-                </label>
-              </div>
-
-              <div className="export-settings-actions">
-                <button
-                  className="button ghost tiny"
-                  type="button"
-                  onClick={() => {
-                    if (largestClipResolution.area <= 0) {
-                      return;
-                    }
-                    setExportWidthInput(String(largestClipResolution.width));
-                    setExportHeightInput(String(largestClipResolution.height));
-                  }}
-                  disabled={isBusy || largestClipResolution.area <= 0 || !exportSupportsVideo}
-                >
-                  Use Largest Source
-                </button>
-                <button
-                  className="button ghost tiny"
-                  type="button"
-                  onClick={() => {
-                    setExportWidthInput("");
-                    setExportHeightInput("");
-                  }}
-                  disabled={isBusy || !exportSupportsVideo}
-                >
-                  Auto Workspace
-                </button>
-                <button
-                  className="button ghost tiny"
-                  type="button"
-                  onClick={() => setIsExportAdvancedOpen((previous) => !previous)}
-                  disabled={isBusy}
-                >
-                  {isExportAdvancedOpen ? "Hide Advanced" : "Show Advanced"}
-                </button>
-              </div>
-
-              {isExportAdvancedOpen && (
-                <div className="export-advanced">
-                  <p className="export-settings-subtitle">Advanced</p>
-                  <div className="toggle-row">
-                    <label className={`toggle-item${disableVideoToggle ? " disabled" : ""}`}>
-                      <input
-                        type="checkbox"
-                        checked={effectiveIncludeVideo}
-                        onChange={(event) => {
-                          const nextValue = event.target.checked;
-                          if (!nextValue && !effectiveIncludeAudio) {
-                            return;
-                          }
-                          setIncludeVideoInExport(nextValue);
-                        }}
-                        disabled={disableVideoToggle}
-                      />
-                      Include Video
-                    </label>
-                    <label className={`toggle-item${disableAudioToggle ? " disabled" : ""}`}>
-                      <input
-                        type="checkbox"
-                        checked={effectiveIncludeAudio}
-                        onChange={(event) => {
-                          const nextValue = event.target.checked;
-                          if (!nextValue && !effectiveIncludeVideo) {
-                            return;
-                          }
-                          setIncludeAudioInExport(nextValue);
-                        }}
-                        disabled={disableAudioToggle}
-                      />
-                      Include Audio
-                    </label>
-                  </div>
-                  <div className="export-settings-grid export-advanced-grid">
-                    <label>
-                      Video Bitrate (kbps)
-                      <input
-                        className="time-input"
-                        type="number"
-                        min={100}
-                        max={200000}
-                        step={1}
-                        placeholder="Auto"
-                        value={exportVideoBitrateInput}
-                        onChange={(event) => setExportVideoBitrateInput(event.target.value)}
-                        disabled={isBusy || !effectiveIncludeVideo}
-                      />
-                    </label>
-                    <label>
-                      Audio Bitrate (kbps)
-                      <input
-                        className="time-input"
-                        type="number"
-                        min={8}
-                        max={3200}
-                        step={1}
-                        placeholder="Auto"
-                        value={exportAudioBitrateInput}
-                        onChange={(event) => setExportAudioBitrateInput(event.target.value)}
-                        disabled={isBusy || !effectiveIncludeAudio}
-                      />
-                    </label>
-                  </div>
-                  <p className="hint">Leave bitrate empty to use codec defaults.</p>
-                </div>
-              )}
-
-              <p className="hint">
-                Workspace auto uses the largest source clip ({autoResolutionLabel}). FPS auto keeps source timing.
-              </p>
-              {exportSupportsVideo && (
-                <p className="hint">
-                  Crop coordinates use workspace pixels. Enabled crop outputs {normalizedCropRect.width} x{" "}
-                  {normalizedCropRect.height}.
-                </p>
-              )}
-              {!exportSupportsVideo && (
-                <p className="hint">
-                  This format is audio-only. Workspace, crop, and FPS settings are ignored.
-                </p>
-              )}
-              {!exportSupportsAudio && <p className="hint">This format does not support audio.</p>}
-            </div>
-
-            <div className="export-row">
-              <div className="export-mode">
-                <button
-                  className={`button ghost tiny${exportMode === "fit" ? " active" : ""}`}
-                  type="button"
-                  onClick={() => setExportMode("fit")}
-                  disabled={isBusy || !exportSupportsVideo}
-                >
-                  Fit Canvas
-                </button>
-                <button
-                  className={`button ghost tiny${exportMode === "fast" ? " active" : ""}`}
-                  type="button"
-                  onClick={() => setExportMode("fast")}
-                  disabled={isBusy || !exportSupportsVideo}
-                >
-                  Fast Copy
-                </button>
-              </div>
-
               <button
-                className="button primary"
+                className={`dock-tab${utilityTab === "crop" ? " active" : ""}`}
                 type="button"
-                onClick={() => void handleExport()}
-                disabled={isBusy || editedSegments.length === 0}
+                onClick={() => setUtilityTab("crop")}
               >
-                {isExporting ? "Exporting..." : "Export Edited Video"}
+                Crop
               </button>
             </div>
-
-            <p className="hint">
-              {!exportSupportsVideo
-                ? "Audio-only formats ignore workspace and crop settings."
-                : exportMode === "fit"
-                  ? "Fit Canvas keeps a consistent workspace frame."
-                  : "Fast Copy is only available when no workspace, crop, transform, FPS, or speed changes are applied."}
-            </p>
-
-            {(isExporting || exportStage) && (
-              <div className="progress-block">
-                <p className="progress-label">
-                  {exportStatusMessage ?? (exportStage ? exportStageLabel(exportStage) : "Working...")}
-                </p>
-                <div className="progress-bar">
-                  <span
-                    style={{
-                      width: `${Math.round(Math.min(1, Math.max(0, exportProgress)) * 100)}%`
-                    }}
-                  />
-                </div>
-                <p className="progress-meta">
-                  {exportProgressPercentText}
-                  {exportFrameCountText ? ` · ${exportFrameCountText}` : ""}
-                  {exportEtaText ? ` · ${exportEtaText}` : ""}
-                </p>
-              </div>
-            )}
+            <section className="workspace-panel stacked-utility-panel">
+              {utilityTab === "crop" && cropPanelContent}
+              {utilityTab === "inspector" && inspectorContent}
+            </section>
           </>
         )}
-      </section>
+      </div>
     </main>
   );
 }
