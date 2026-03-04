@@ -74,10 +74,12 @@ interface ClipRuntime {
 
 const PREVIEW_EPSILON = 0.0001;
 const SEGMENT_EDGE_EPSILON = 0.001;
-const MAX_DECODED_QUEUE_SIZE = 14;
-const MAX_IN_FLIGHT_DECODE_CHUNKS = 12;
+const MAX_DECODED_QUEUE_SIZE = 24;
+const MAX_IN_FLIGHT_DECODE_CHUNKS = 24;
 const SEEK_BACKWARD_RESET_THRESHOLD_SEC = 0.25;
-const LOOKAHEAD_SECONDS = 0.2;
+const LOOKAHEAD_SECONDS = 0.35;
+const SEEK_DECODER_WAIT_MS = 120;
+const PLAYBACK_DECODER_WAIT_MS = 8;
 const DEMUX_TIMEOUT_MS = 15000;
 
 function clamp(value: number, min: number, max: number): number {
@@ -897,6 +899,7 @@ export class TimelinePreviewEngine {
     const samples = state.demuxed.samples;
     const lookahead = isSeek ? LOOKAHEAD_SECONDS * 1.5 : LOOKAHEAD_SECONDS;
     const wantedUntilSec = sourceTimeSec + lookahead;
+    const waitBudgetMs = isSeek ? SEEK_DECODER_WAIT_MS : PLAYBACK_DECODER_WAIT_MS;
 
     let fedUntilSec = state.frameQueue[state.frameQueue.length - 1]?.timestampSec ?? -1;
     if (state.decodeCursor > 0 && fedUntilSec < 0) {
@@ -912,7 +915,7 @@ export class TimelinePreviewEngine {
     ) {
       if (state.decoder.decodeQueueSize >= MAX_IN_FLIGHT_DECODE_CHUNKS) {
         const queueLengthBeforeWait = state.frameQueue.length;
-        await this.waitForDecoderOutput(state, queueLengthBeforeWait);
+        await this.waitForDecoderOutput(state, queueLengthBeforeWait, waitBudgetMs);
         if (
           state.decoder.decodeQueueSize >= MAX_IN_FLIGHT_DECODE_CHUNKS &&
           state.frameQueue.length === queueLengthBeforeWait
@@ -938,21 +941,25 @@ export class TimelinePreviewEngine {
       fedUntilSec = Math.max(fedUntilSec, sample.ctsSec + sample.durationSec);
     }
 
-    if (fedAny) {
-      await this.waitForDecoderOutput(state, queueLengthBeforeDecode);
+    if (fedAny && (isSeek || state.frameQueue.length <= queueLengthBeforeDecode)) {
+      await this.waitForDecoderOutput(state, queueLengthBeforeDecode, waitBudgetMs);
     }
 
     state.lastTargetSourceSec = sourceTimeSec;
   }
 
-  private async waitForDecoderOutput(state: ClipRuntime, previousQueueLength: number): Promise<void> {
+  private async waitForDecoderOutput(
+    state: ClipRuntime,
+    previousQueueLength: number,
+    maxWaitMs: number
+  ): Promise<void> {
     const decoder = state.decoder;
     if (!decoder) {
       return;
     }
 
     const startMs = performance.now();
-    while (performance.now() - startMs < 120) {
+    while (performance.now() - startMs < maxWaitMs) {
       if (state.frameQueue.length > previousQueueLength) {
         return;
       }
@@ -1088,7 +1095,7 @@ export class TimelinePreviewEngine {
       );
 
       const drew = this.drawQueuedFrame(state, segment, sourceTimeSec, isSeek);
-      if (!drew) {
+      if (!drew && isSeek) {
         this.paintBlackFrame();
       }
   }

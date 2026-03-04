@@ -901,6 +901,10 @@ function App() {
   const togglePlayPauseRef = useRef<() => void>(() => undefined);
   const cropDragRef = useRef<CropDragState | null>(null);
   const previewPanDragRef = useRef<PreviewPanDragState | null>(null);
+  const pendingCropRectRef = useRef<CropRect | null>(null);
+  const cropDragRafRef = useRef<number | null>(null);
+  const pendingPreviewPanRef = useRef<{ panX: number; panY: number } | null>(null);
+  const previewPanRafRef = useRef<number | null>(null);
   const splitterDragRef = useRef<SplitterDragState | null>(null);
   const previousWorkspaceSizeRef = useRef<{ width: number; height: number } | null>(null);
   const previousSelectedTimelineItemIdRef = useRef<string | null>(null);
@@ -1161,6 +1165,90 @@ function App() {
     bottom: Math.max(0, 100 - cropRectPercent.top - cropRectPercent.height)
   };
 
+  function flushPendingCropRect(): void {
+    if (cropDragRafRef.current !== null) {
+      window.cancelAnimationFrame(cropDragRafRef.current);
+      cropDragRafRef.current = null;
+    }
+    const pendingRect = pendingCropRectRef.current;
+    pendingCropRectRef.current = null;
+    if (!pendingRect) {
+      return;
+    }
+    setCropRect((previous) => {
+      if (
+        previous.x === pendingRect.x &&
+        previous.y === pendingRect.y &&
+        previous.width === pendingRect.width &&
+        previous.height === pendingRect.height
+      ) {
+        return previous;
+      }
+      return pendingRect;
+    });
+  }
+
+  function scheduleCropRectUpdate(nextRect: CropRect): void {
+    pendingCropRectRef.current = nextRect;
+    if (cropDragRafRef.current !== null) {
+      return;
+    }
+    cropDragRafRef.current = window.requestAnimationFrame(() => {
+      cropDragRafRef.current = null;
+      const pendingRect = pendingCropRectRef.current;
+      pendingCropRectRef.current = null;
+      if (!pendingRect) {
+        return;
+      }
+      setCropRect((previous) => {
+        if (
+          previous.x === pendingRect.x &&
+          previous.y === pendingRect.y &&
+          previous.width === pendingRect.width &&
+          previous.height === pendingRect.height
+        ) {
+          return previous;
+        }
+        return pendingRect;
+      });
+    });
+  }
+
+  function flushPendingPreviewPan(): void {
+    if (previewPanRafRef.current !== null) {
+      window.cancelAnimationFrame(previewPanRafRef.current);
+      previewPanRafRef.current = null;
+    }
+    const pendingPan = pendingPreviewPanRef.current;
+    pendingPreviewPanRef.current = null;
+    if (!pendingPan) {
+      return;
+    }
+    setSelectedTimelineTransform({
+      panX: pendingPan.panX,
+      panY: pendingPan.panY
+    });
+  }
+
+  function schedulePreviewPanUpdate(nextPan: { panX: number; panY: number }): void {
+    pendingPreviewPanRef.current = nextPan;
+    if (previewPanRafRef.current !== null) {
+      return;
+    }
+    previewPanRafRef.current = window.requestAnimationFrame(() => {
+      previewPanRafRef.current = null;
+      const pendingPan = pendingPreviewPanRef.current;
+      pendingPreviewPanRef.current = null;
+      if (!pendingPan) {
+        return;
+      }
+      setSelectedTimelineTransform({
+        panX: pendingPan.panX,
+        panY: pendingPan.panY
+      });
+    });
+  }
+
   useEffect(() => {
     clipsRef.current = clips;
   }, [clips]);
@@ -1170,6 +1258,16 @@ function App() {
       for (const clip of clipsRef.current) {
         URL.revokeObjectURL(clip.url);
       }
+      if (cropDragRafRef.current !== null) {
+        window.cancelAnimationFrame(cropDragRafRef.current);
+        cropDragRafRef.current = null;
+      }
+      if (previewPanRafRef.current !== null) {
+        window.cancelAnimationFrame(previewPanRafRef.current);
+        previewPanRafRef.current = null;
+      }
+      pendingCropRectRef.current = null;
+      pendingPreviewPanRef.current = null;
     };
   }, []);
 
@@ -1478,24 +1576,40 @@ function App() {
 
   useEffect(() => {
     if (!selectedTimelineItem) {
-      setSelectedSpeedInput("");
-      setSelectedDurationMinutesInput("");
-      setSelectedDurationSecondsInput("");
-      setSelectedDurationMillisecondsInput("");
-      setSelectedScaleInput("");
-      setSelectedPanXInput("");
-      setSelectedPanYInput("");
+      setSelectedSpeedInput((previous) => (previous === "" ? previous : ""));
+      setSelectedDurationMinutesInput((previous) => (previous === "" ? previous : ""));
+      setSelectedDurationSecondsInput((previous) => (previous === "" ? previous : ""));
+      setSelectedDurationMillisecondsInput((previous) => (previous === "" ? previous : ""));
+      setSelectedScaleInput((previous) => (previous === "" ? previous : ""));
+      setSelectedPanXInput((previous) => (previous === "" ? previous : ""));
+      setSelectedPanYInput((previous) => (previous === "" ? previous : ""));
       return;
     }
+
+    if (isDraggingPreviewPan) {
+      return;
+    }
+
     const durationParts = durationPartsFromSeconds(selectedTimelineItem.duration);
-    setSelectedSpeedInput(formatSpeedLabel(selectedTimelineItem.speed));
-    setSelectedDurationMinutesInput(durationParts.minutes.toString());
-    setSelectedDurationSecondsInput(durationParts.seconds.toString());
-    setSelectedDurationMillisecondsInput(durationParts.milliseconds.toString());
-    setSelectedScaleInput(formatScaleLabel(selectedTimelineItem.scale));
-    setSelectedPanXInput(normalizePanValue(selectedTimelineItem.panX).toString());
-    setSelectedPanYInput(normalizePanValue(selectedTimelineItem.panY).toString());
+    const nextSpeed = formatSpeedLabel(selectedTimelineItem.speed);
+    const nextMinutes = durationParts.minutes.toString();
+    const nextSeconds = durationParts.seconds.toString();
+    const nextMilliseconds = durationParts.milliseconds.toString();
+    const nextScale = formatScaleLabel(selectedTimelineItem.scale);
+    const nextPanX = normalizePanValue(selectedTimelineItem.panX).toString();
+    const nextPanY = normalizePanValue(selectedTimelineItem.panY).toString();
+
+    setSelectedSpeedInput((previous) => (previous === nextSpeed ? previous : nextSpeed));
+    setSelectedDurationMinutesInput((previous) => (previous === nextMinutes ? previous : nextMinutes));
+    setSelectedDurationSecondsInput((previous) => (previous === nextSeconds ? previous : nextSeconds));
+    setSelectedDurationMillisecondsInput((previous) =>
+      previous === nextMilliseconds ? previous : nextMilliseconds
+    );
+    setSelectedScaleInput((previous) => (previous === nextScale ? previous : nextScale));
+    setSelectedPanXInput((previous) => (previous === nextPanX ? previous : nextPanX));
+    setSelectedPanYInput((previous) => (previous === nextPanY ? previous : nextPanY));
   }, [
+    isDraggingPreviewPan,
     selectedTimelineItemId,
     selectedTimelineItem?.speed,
     selectedTimelineItem?.duration,
@@ -1757,17 +1871,7 @@ function App() {
         cropLockAspect,
         cropAspectRatio
       );
-      setCropRect((previous) => {
-        if (
-          previous.x === nextRect.x &&
-          previous.y === nextRect.y &&
-          previous.width === nextRect.width &&
-          previous.height === nextRect.height
-        ) {
-          return previous;
-        }
-        return nextRect;
-      });
+      scheduleCropRectUpdate(nextRect);
     };
 
     const stopDragging = (event?: PointerEvent): void => {
@@ -1778,6 +1882,7 @@ function App() {
       if (event && event.pointerId !== drag.pointerId) {
         return;
       }
+      flushPendingCropRect();
       cropDragRef.current = null;
       setIsDraggingCrop(false);
     };
@@ -1787,6 +1892,11 @@ function App() {
     window.addEventListener("pointercancel", stopDragging);
 
     return () => {
+      if (cropDragRafRef.current !== null) {
+        window.cancelAnimationFrame(cropDragRafRef.current);
+        cropDragRafRef.current = null;
+      }
+      pendingCropRectRef.current = null;
       window.removeEventListener("pointermove", handlePointerMove);
       window.removeEventListener("pointerup", stopDragging);
       window.removeEventListener("pointercancel", stopDragging);
@@ -1799,6 +1909,7 @@ function App() {
     }
 
     if (isBusy || !cropEnabled || clips.length === 0) {
+      flushPendingCropRect();
       cropDragRef.current = null;
       setIsDraggingCrop(false);
     }
@@ -1833,10 +1944,7 @@ function App() {
             drag.drawHeight,
             drag.cropRect
           );
-      setSelectedTimelineTransform({
-        panX: snapped.panX,
-        panY: snapped.panY
-      });
+      schedulePreviewPanUpdate(snapped);
     };
 
     const stopDragging = (event?: PointerEvent): void => {
@@ -1847,6 +1955,7 @@ function App() {
       if (event && event.pointerId !== drag.pointerId) {
         return;
       }
+      flushPendingPreviewPan();
       previewPanDragRef.current = null;
       setIsDraggingPreviewPan(false);
     };
@@ -1856,6 +1965,11 @@ function App() {
     window.addEventListener("pointercancel", stopDragging);
 
     return () => {
+      if (previewPanRafRef.current !== null) {
+        window.cancelAnimationFrame(previewPanRafRef.current);
+        previewPanRafRef.current = null;
+      }
+      pendingPreviewPanRef.current = null;
       window.removeEventListener("pointermove", handlePointerMove);
       window.removeEventListener("pointerup", stopDragging);
       window.removeEventListener("pointercancel", stopDragging);
@@ -1868,6 +1982,7 @@ function App() {
     }
 
     if (isBusy || !cropEnabled || !selectedTimelineItem || clips.length === 0) {
+      flushPendingPreviewPan();
       previewPanDragRef.current = null;
       setIsDraggingPreviewPan(false);
     }
@@ -2401,27 +2516,38 @@ function App() {
       return;
     }
 
-    setTimelineItems((previous) =>
-      previous.map((item) =>
-        item.id === selectedTimelineItemId
-          ? (() => {
-              const nextScale =
-                next.scale === undefined ? clampPieceScale(item.scale) : clampPieceScale(next.scale);
-              const rawPanX =
-                next.panX === undefined ? item.panX : normalizePanValue(next.panX);
-              const rawPanY =
-                next.panY === undefined ? item.panY : normalizePanValue(next.panY);
-              return {
-                ...item,
-                scale: nextScale,
-                panX: rawPanX,
-                panY: rawPanY
-              };
-            })()
-          : item
-      )
-    );
-    setError(null);
+    setTimelineItems((previous) => {
+      let hasChanged = false;
+      const nextItems = previous.map((item) => {
+        if (item.id !== selectedTimelineItemId) {
+          return item;
+        }
+
+        const nextScale =
+          next.scale === undefined ? clampPieceScale(item.scale) : clampPieceScale(next.scale);
+        const nextPanX = next.panX === undefined ? item.panX : normalizePanValue(next.panX);
+        const nextPanY = next.panY === undefined ? item.panY : normalizePanValue(next.panY);
+
+        if (
+          nearlyEqual(nextScale, item.scale) &&
+          nearlyEqual(nextPanX, item.panX) &&
+          nearlyEqual(nextPanY, item.panY)
+        ) {
+          return item;
+        }
+
+        hasChanged = true;
+        return {
+          ...item,
+          scale: nextScale,
+          panX: nextPanX,
+          panY: nextPanY
+        };
+      });
+
+      return hasChanged ? nextItems : previous;
+    });
+    setError((previous) => (previous === null ? previous : null));
   }
 
   function handleSelectedSpeedInputChange(value: string): void {
@@ -3941,99 +4067,6 @@ function App() {
       ) : (
         <p className="queue-empty">Select a timeline piece to edit speed and transform.</p>
       )}
-
-      <section className="inspector-section">
-        <div className="inspector-section-static-title">Workspace / Playback</div>
-        <div className="inspector-section-body">
-          <div className="input-grid-4">
-            <label>
-              Format
-              <select
-                className="time-input export-format-select"
-                value={exportFormat}
-                onChange={(event) => setExportFormat(event.target.value as ExportFormat)}
-                disabled={isBusy}
-              >
-                {EXPORT_FORMAT_OPTIONS.map((option) => (
-                  <option
-                    key={option.value}
-                    value={option.value}
-                  >
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              FPS
-              <input
-                className="time-input"
-                type="number"
-                min={1}
-                max={120}
-                step={1}
-                placeholder="Auto"
-                value={exportFpsInput}
-                onChange={(event) => setExportFpsInput(event.target.value)}
-                disabled={isBusy || !exportSupportsVideo}
-              />
-            </label>
-            <label>
-              Workspace Width
-              <input
-                className="time-input"
-                type="number"
-                min={2}
-                step={1}
-                placeholder="Auto"
-                value={exportWidthInput}
-                onChange={(event) => setExportWidthInput(event.target.value)}
-                disabled={isBusy || !exportSupportsVideo}
-              />
-            </label>
-            <label>
-              Workspace Height
-              <input
-                className="time-input"
-                type="number"
-                min={2}
-                step={1}
-                placeholder="Auto"
-                value={exportHeightInput}
-                onChange={(event) => setExportHeightInput(event.target.value)}
-                disabled={isBusy || !exportSupportsVideo}
-              />
-            </label>
-          </div>
-          <div className="piece-speed-presets">
-            <button
-              className="button ghost tiny"
-              type="button"
-              onClick={() => {
-                if (largestClipResolution.area <= 0) {
-                  return;
-                }
-                setExportWidthInput(String(largestClipResolution.width));
-                setExportHeightInput(String(largestClipResolution.height));
-              }}
-              disabled={isBusy || largestClipResolution.area <= 0 || !exportSupportsVideo}
-            >
-              Use Largest Source
-            </button>
-            <button
-              className="button ghost tiny"
-              type="button"
-              onClick={() => {
-                setExportWidthInput("");
-                setExportHeightInput("");
-              }}
-              disabled={isBusy || !exportSupportsVideo}
-            >
-              Auto Workspace
-            </button>
-          </div>
-        </div>
-      </section>
     </div>
   );
 
