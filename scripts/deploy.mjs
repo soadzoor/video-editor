@@ -105,6 +105,10 @@ function commitSubjectsSince(baseRevision, fromRevision) {
 async function main() {
   await ensureDirectoryExists(distDir, "Build output directory");
   await ensureDirectoryExists(deployDir, "Deploy directory");
+  const deployBranch = runGit(["branch", "--show-current"], deployDir);
+  if (!deployBranch) {
+    throw new Error(`Deploy worktree is not on a branch: ${deployDir}`);
+  }
 
   const ghPagesHead = runGit(["rev-parse", "HEAD"], deployDir);
   const mainRef = resolveMainRef();
@@ -117,21 +121,22 @@ async function main() {
 
   if (!hasStagedChanges(deployDir)) {
     console.log("No deploy changes to commit.");
-    return;
+  } else {
+    const title =
+      subjects.length > 0
+        ? `Deploy main (${subjects.length} commit${subjects.length === 1 ? "" : "s"})`
+        : "Deploy main";
+    const body =
+      subjects.length > 0
+        ? subjects.map((subject) => `- ${subject}`).join("\n")
+        : "- No new main commits since current gh-pages HEAD.";
+
+    runGit(["commit", "-m", title, "-m", body], deployDir);
+    console.log(`Committed deploy artifacts to ${deployDir}`);
   }
 
-  const title =
-    subjects.length > 0
-      ? `Deploy main (${subjects.length} commit${subjects.length === 1 ? "" : "s"})`
-      : "Deploy main";
-  const body =
-    subjects.length > 0
-      ? subjects.map((subject) => `- ${subject}`).join("\n")
-      : "- No new main commits since current gh-pages HEAD.";
-
-  runGit(["commit", "-m", title, "-m", body], deployDir);
-
-  console.log(`Committed deploy artifacts to ${deployDir}`);
+  runGit(["push", "origin", deployBranch], deployDir);
+  console.log(`Pushed deploy branch \"${deployBranch}\" to origin.`);
 }
 
 main().catch((error) => {
