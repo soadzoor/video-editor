@@ -1,18 +1,63 @@
-# Browser Video Editor (TypeScript)
+# Browser Video Editor
 
-A simple, browser-based video editor where all processing runs on the user's device (no backend).
+Local-first browser video editor built with React + TypeScript.  
+All media processing runs on the user's device with `ffmpeg.wasm` (no backend upload pipeline).
 
 Live demo (GitHub Pages): https://soadzoor.github.io/video-editor/
 
-## Current Status
+## Product Demo Video
 
-- Timeline-first workflow implemented:
-  - Drag and drop local video files
-  - Multiple files are concatenated by default on a single timeline
-  - One main preview player with play/pause + global seek
-  - Timeline trim controls (start/end keep range)
-  - Timeline cut controls (add/remove cut ranges)
-  - Single export button that finalizes and downloads the edited video
+[![Watch the product demo](https://img.youtube.com/vi/Gv3_6p-ZM4Y/hqdefault.jpg)](https://youtu.be/Gv3_6p-ZM4Y)
+
+GitHub README pages do not support iframe embeds, so this uses a clickable preview image.
+
+## Current Status (March 2026)
+
+Implemented and working end-to-end:
+
+- Local media ingest:
+  - Drag-and-drop or file picker import for local `video/*` files
+  - Per-file metadata ingestion (duration, width, height)
+  - Media bin with remove/clear actions
+- Timeline editing:
+  - Clips are appended into one timeline track in import order
+  - Reorder timeline pieces with drag-and-drop
+  - `Razor` tool to split a piece at cursor position
+  - Delete selected timeline piece
+  - Global trim window (`In` / `Out`) with draggable edges
+- Preview and transport:
+  - Canvas preview with play/pause
+  - Draggable playhead seek
+  - Keyboard shortcuts: `Space` (play/pause), `ArrowLeft` / `ArrowRight` (frame step)
+  - WebCodecs-based timeline preview engine (with MP4 demux via `mp4box`)
+- Piece-level controls (Inspector):
+  - Speed control (`0.001x` to `1000x`) via numeric input, logarithmic slider, and presets
+  - Duration editing (min/sec/ms) that maps to segment speed
+  - Transform controls: scale + pan (`X`, `Y`)
+  - Quick actions: `Fill Crop` and `Reset Transform`
+- Global crop controls:
+  - Enable/disable crop
+  - Interactive crop rectangle in preview (drag/move/resize handles)
+  - Numeric crop inputs (`X`, `Y`, `W`, `H`)
+  - Optional aspect-ratio lock
+- Export pipeline:
+  - Export formats: `mp4`, `mov`, `avi`, `mkv`, `gif`, `mp3`, `wav`
+  - Export mode: `Fit Canvas` or `Fast Copy` (when compatible)
+  - Optional workspace size (`width`/`height`) and FPS
+  - Optional video/audio stream toggles and bitrate overrides
+  - Multi-stage progress reporting with percent, frame counts, and ETA
+  - Auto-download of rendered output
+- Workspace UX:
+  - Desktop 3-pane layout (crop panel, preview, inspector) with resizable splitters
+  - Collapsible side panels
+  - Mobile/stacked layout with utility tabs
+  - Layout persistence in `localStorage`
+
+## Stack
+
+- App: React 19 + TypeScript + Vite 7
+- Processing: `@ffmpeg/ffmpeg` (`ffmpeg.wasm`)
+- Preview: WebCodecs + `mp4box`
 
 ## Getting Started
 
@@ -23,51 +68,27 @@ npm run dev
 
 Then open the local Vite URL (typically `http://localhost:5173`).
 
-## Goals
+## Build
 
-- Drag and drop local video files
-- Play/pause preview
-- Concatenate videos
-- Cut/remove sections
-- Crop
-- Resize
-- Trim
+```bash
+npm run build
+```
 
-## Tech Direction (Client-Only)
+## Deploy
 
-- App: TypeScript + Vite
-- UI: React (or Solid) + simple timeline UI
-- Processing: `@ffmpeg/ffmpeg` (WASM)
-- Optional performance path: WebCodecs + Web Workers for future optimization
-- Storage: in-memory + optional IndexedDB for session persistence
+```bash
+npm run deploy
+```
 
-## Why Start This Way
+Deployment script behavior (`scripts/deploy.mjs`):
 
-- `ffmpeg.wasm` gives broad editing capability in the browser without server code.
-- We can ship features incrementally and keep everything local-first.
-- Later, we can optimize specific operations with WebCodecs if needed.
+- Builds the app (`dist/`)
+- Copies artifacts into sibling worktree directory `../video-editor_deploy`
+- Commits changes there
+- Pushes the current deploy branch to `origin`
 
-## Incremental Plan
+## Notes / Limitations
 
-1. **Bootstrap project**
-   - Initialize Vite + TypeScript app
-   - Add drag-and-drop file intake
-   - Render preview in `<video>` with play/pause controls
-2. **Concatenate**
-   - Import multiple files
-   - Build concat pipeline in ffmpeg.wasm
-   - Export merged video
-3. **Trim and cut**
-   - Add timeline range selection
-   - Trim start/end
-   - Remove middle sections by splitting + concat
-4. **Crop and resize**
-   - Add simple crop box presets and custom dimensions
-   - Apply `crop` and `scale` filters
-5. **Polish**
-   - Progress indicators, cancellation, error handling
-   - Worker offloading and memory cleanup
-
-## Next Step
-
-Milestone 5: reintroduce crop/resize into the timeline export pipeline, then polish (cancellation, memory tuning, richer error feedback).
+- WebCodecs preview requires a supported browser. If unsupported, the app shows a fallback notice.
+- Editing model is currently a single timeline track (no multi-track compositing/transitions yet).
+- Project-level edit data is not persisted; only layout preferences are stored locally.
