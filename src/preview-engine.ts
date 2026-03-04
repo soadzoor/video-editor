@@ -48,6 +48,7 @@ interface DemuxedClipVideo {
   height: number;
   durationSec: number;
   samples: DemuxedVideoSample[];
+  presentationTimestamps: number[];
   keyframeIndices: number[];
   description?: Uint8Array<ArrayBuffer>;
 }
@@ -78,8 +79,12 @@ const MAX_DECODED_QUEUE_SIZE = 24;
 const MAX_IN_FLIGHT_DECODE_CHUNKS = 24;
 const SEEK_BACKWARD_RESET_THRESHOLD_SEC = 0.25;
 const LOOKAHEAD_SECONDS = 0.35;
-const SEEK_DECODER_WAIT_MS = 120;
+const SEEK_DECODER_WAIT_MS = 220;
 const PLAYBACK_DECODER_WAIT_MS = 8;
+const SEEK_RENDER_RETRY_COUNT = 3;
+const SEEK_RENDER_RETRY_DELAY_MS = 16;
+const PLAYBACK_POST_SEEK_HOLD_MS = 260;
+const PLAYBACK_POST_SEEK_HOLD_WINDOW_MS = 1500;
 const DEMUX_TIMEOUT_MS = 15000;
 
 function clamp(value: number, min: number, max: number): number {
@@ -358,10 +363,28 @@ async function demuxVideoTrack(file: File): Promise<DemuxedClipVideo> {
         }
       }
 
-      const trackDurationSec =
-        samples.length > 0
-          ? samples[samples.length - 1].ctsSec + samples[samples.length - 1].durationSec
-          : videoTrack.duration / Math.max(1, videoTrack.timescale);
+      let trackDurationSec = videoTrack.duration / Math.max(1, videoTrack.timescale);
+      if (samples.length > 0) {
+        trackDurationSec = 0;
+        for (const sample of samples) {
+          trackDurationSec = Math.max(trackDurationSec, sample.ctsSec + sample.durationSec);
+        }
+      }
+
+      const presentationTimestamps = samples
+        .map((sample) => sample.ctsSec)
+        .filter((value) => Number.isFinite(value))
+        .sort((a, b) => a - b);
+      const uniquePresentationTimestamps: number[] = [];
+      for (const timestamp of presentationTimestamps) {
+        const previous = uniquePresentationTimestamps[uniquePresentationTimestamps.length - 1];
+        if (
+          previous === undefined ||
+          Math.abs(timestamp - previous) > PREVIEW_EPSILON
+        ) {
+          uniquePresentationTimestamps.push(timestamp);
+        }
+      }
 
       resolve({
         codec: videoTrack.codec,
@@ -369,6 +392,7 @@ async function demuxVideoTrack(file: File): Promise<DemuxedClipVideo> {
         height: videoTrack.video?.height ?? videoTrack.track_height,
         durationSec: Math.max(0, trackDurationSec),
         samples,
+        presentationTimestamps: uniquePresentationTimestamps,
         keyframeIndices,
         description: extractDecoderDescription(videoTrack, mp4File)
       });
@@ -481,11 +505,18 @@ export class TimelinePreviewEngine {
 
   private renderLoopPromise: Promise<void> | null = null;
   private pendingRenderRequest: { editedTimeSec: number; isSeek: boolean } | null = null;
+  private seekRenderRequestId = 0;
+  private lastRenderOutcome: { editedTimeSec: number; isSeek: boolean; drewFrame: boolean } | null =
+    null;
+  private lastSeekPerfMs = Number.NEGATIVE_INFINITY;
+  private playbackClockHoldActive = false;
+  private playbackClockHoldUntilMs = 0;
 
   private audioContext: AudioContext | null = null;
   private audioGainNode: GainNode | null = null;
   private activeAudioNode: AudioBufferSourceNode | null = null;
   private activeAudioSegmentId: string | null = null;
+  private audioSyncGeneration = 0;
 
   constructor(
     canvas: HTMLCanvasElement,
@@ -554,7 +585,7 @@ export class TimelinePreviewEngine {
       void this.ensureDemuxedClip(segment.clipId);
     }
 
-    await this.requestRender(this.editedTimeSec, true);
+    await this.renderSeekWithRetry(this.editedTimeSec);
 
     if (this.isPlaying) {
       await this.syncAudioToCurrentPosition();
@@ -570,6 +601,7 @@ export class TimelinePreviewEngine {
   }
 
   public seek(editedTimeSec: number): void {
+    this.lastSeekPerfMs = performance.now();
     const bounded = clamp(editedTimeSec, 0, this.durationSec);
     this.setEditedTime(bounded);
 
@@ -577,9 +609,40 @@ export class TimelinePreviewEngine {
       this.playAnchorEditedSec = bounded;
       this.playAnchorPerfMs = performance.now();
       void this.syncAudioToCurrentPosition();
+      void this.requestRender(bounded, true);
+      return;
     }
 
-    void this.requestRender(bounded, true);
+    void this.renderSeekWithRetry(bounded);
+  }
+
+  public async seekAndRender(editedTimeSec: number): Promise<void> {
+    this.lastSeekPerfMs = performance.now();
+    const bounded = clamp(editedTimeSec, 0, this.durationSec);
+    this.setEditedTime(bounded);
+
+    if (this.isPlaying) {
+      this.playAnchorEditedSec = bounded;
+      this.playAnchorPerfMs = performance.now();
+      await this.requestRender(bounded, true);
+      return;
+    }
+
+    await this.renderSeekWithRetry(bounded);
+  }
+
+  public async stepFrame(direction: -1 | 1): Promise<number> {
+    if (this.durationSec <= 0 || this.segments.length === 0) {
+      return this.editedTimeSec;
+    }
+
+    const targetEditedTime = await this.findFrameStepTargetEditedTime(direction);
+    if (targetEditedTime === null || nearlyEqual(targetEditedTime, this.editedTimeSec)) {
+      return this.editedTimeSec;
+    }
+
+    await this.seekAndRender(targetEditedTime);
+    return this.editedTimeSec;
   }
 
   public async play(): Promise<void> {
@@ -588,16 +651,27 @@ export class TimelinePreviewEngine {
     }
 
     if (this.editedTimeSec >= this.durationSec - SEGMENT_EDGE_EPSILON) {
-      this.seek(0);
+      this.setEditedTime(0);
     }
+
+    // Warm the frame at the current position before starting the wall-clock
+    // playback anchor. This prevents a short perceived fast-forward period
+    // immediately after manual seeks.
+    await this.renderSeekWithRetry(this.editedTimeSec);
 
     this.isPlaying = true;
     this.playAnchorEditedSec = this.editedTimeSec;
     this.playAnchorPerfMs = performance.now();
+    this.playbackClockHoldActive = this.shouldHoldClockAfterSeek(this.playAnchorPerfMs);
+    this.playbackClockHoldUntilMs = this.playbackClockHoldActive
+      ? this.playAnchorPerfMs + PLAYBACK_POST_SEEK_HOLD_MS
+      : 0;
     this.callbacks.onPlayStateChange?.(true);
 
     await this.ensureAudioContext();
-    await this.syncAudioToCurrentPosition();
+    if (!this.playbackClockHoldActive) {
+      await this.syncAudioToCurrentPosition();
+    }
 
     this.rafId = window.requestAnimationFrame(this.onAnimationFrame);
   }
@@ -615,6 +689,9 @@ export class TimelinePreviewEngine {
 
     this.stopActiveAudioNode();
     this.activeAudioSegmentId = null;
+    this.audioSyncGeneration += 1;
+    this.playbackClockHoldActive = false;
+    this.playbackClockHoldUntilMs = 0;
     this.callbacks.onPlayStateChange?.(false);
   }
 
@@ -635,6 +712,29 @@ export class TimelinePreviewEngine {
 
   private readonly onAnimationFrame = (nowMs: number): void => {
     if (!this.isPlaying) {
+      return;
+    }
+
+    if (this.playbackClockHoldActive) {
+      void this.requestRender(this.editedTimeSec, true);
+
+      const outcome = this.lastRenderOutcome;
+      const holdFrameReady =
+        outcome !== null &&
+        outcome.isSeek &&
+        outcome.drewFrame &&
+        nearlyEqual(outcome.editedTimeSec, this.editedTimeSec);
+      const holdExpired = nowMs >= this.playbackClockHoldUntilMs;
+
+      if (holdFrameReady || holdExpired) {
+        this.playbackClockHoldActive = false;
+        this.playbackClockHoldUntilMs = 0;
+        this.playAnchorEditedSec = this.editedTimeSec;
+        this.playAnchorPerfMs = nowMs;
+        void this.syncAudioToCurrentPosition();
+      }
+
+      this.rafId = window.requestAnimationFrame(this.onAnimationFrame);
       return;
     }
 
@@ -668,6 +768,166 @@ export class TimelinePreviewEngine {
 
     this.editedTimeSec = bounded;
     this.callbacks.onTimeUpdate?.(bounded);
+  }
+
+  private shouldHoldClockAfterSeek(nowMs: number): boolean {
+    if (!Number.isFinite(this.lastSeekPerfMs)) {
+      return false;
+    }
+    const elapsedSinceSeekMs = nowMs - this.lastSeekPerfMs;
+    return elapsedSinceSeekMs >= 0 && elapsedSinceSeekMs <= PLAYBACK_POST_SEEK_HOLD_WINDOW_MS;
+  }
+
+  private editedTimeFromSourceTime(segment: PreviewSegment, sourceTimeSec: number): number {
+    const boundedSource = clamp(
+      sourceTimeSec,
+      segment.sourceStart,
+      Math.max(segment.sourceStart, segment.sourceEnd - PREVIEW_EPSILON)
+    );
+    const speed = Math.max(PREVIEW_EPSILON, segment.speed);
+    const edited = segment.editedStart + (boundedSource - segment.sourceStart) / speed;
+    return clamp(
+      edited,
+      segment.editedStart,
+      Math.max(segment.editedStart, segment.editedEnd - PREVIEW_EPSILON)
+    );
+  }
+
+  private findFirstTimestampAtOrAfter(
+    timestamps: number[],
+    minTargetSec: number,
+    segmentSourceMin: number,
+    segmentSourceMax: number
+  ): number | null {
+    for (const cts of timestamps) {
+      if (cts < segmentSourceMin) {
+        continue;
+      }
+      if (cts > segmentSourceMax) {
+        break;
+      }
+      if (cts >= minTargetSec) {
+        return cts;
+      }
+    }
+    return null;
+  }
+
+  private findLastTimestampAtOrBefore(
+    timestamps: number[],
+    maxTargetSec: number,
+    segmentSourceMin: number,
+    segmentSourceMax: number
+  ): number | null {
+    for (let index = timestamps.length - 1; index >= 0; index -= 1) {
+      const cts = timestamps[index];
+      if (cts > segmentSourceMax) {
+        continue;
+      }
+      if (cts < segmentSourceMin) {
+        break;
+      }
+      if (cts <= maxTargetSec) {
+        return cts;
+      }
+    }
+    return null;
+  }
+
+  private async findFrameStepTargetEditedTime(direction: -1 | 1): Promise<number | null> {
+    const resolved = resolveSegmentAt(this.segments, this.editedTimeSec);
+    if (!resolved) {
+      return null;
+    }
+
+    if (direction > 0) {
+      for (let segmentIndex = resolved.index; segmentIndex < this.segments.length; segmentIndex += 1) {
+        const segment = this.segments[segmentIndex];
+        const segmentSourceMin = segment.sourceStart;
+        const segmentSourceMax = Math.max(segment.sourceStart, segment.sourceEnd - PREVIEW_EPSILON);
+        const clipState = await this.ensureDemuxedClip(segment.clipId);
+        const presentationTimestamps = clipState.demuxed?.presentationTimestamps ?? [];
+
+        const minTargetSec =
+          segmentIndex === resolved.index
+            ? Math.max(segmentSourceMin, resolved.sourceTimeSec + PREVIEW_EPSILON)
+            : segmentSourceMin;
+
+        const sourceTarget =
+          presentationTimestamps.length > 0
+            ? this.findFirstTimestampAtOrAfter(
+                presentationTimestamps,
+                minTargetSec,
+                segmentSourceMin,
+                segmentSourceMax
+              )
+            : null;
+
+        if (sourceTarget !== null) {
+          return this.editedTimeFromSourceTime(segment, sourceTarget);
+        }
+      }
+      return this.editedTimeSec;
+    }
+
+    for (let segmentIndex = resolved.index; segmentIndex >= 0; segmentIndex -= 1) {
+      const segment = this.segments[segmentIndex];
+      const segmentSourceMin = segment.sourceStart;
+      const segmentSourceMax = Math.max(segment.sourceStart, segment.sourceEnd - PREVIEW_EPSILON);
+      const clipState = await this.ensureDemuxedClip(segment.clipId);
+      const presentationTimestamps = clipState.demuxed?.presentationTimestamps ?? [];
+
+      const maxTargetSec =
+        segmentIndex === resolved.index
+          ? Math.min(segmentSourceMax, resolved.sourceTimeSec - PREVIEW_EPSILON)
+          : segmentSourceMax;
+
+      const sourceTarget =
+        presentationTimestamps.length > 0
+          ? this.findLastTimestampAtOrBefore(
+              presentationTimestamps,
+              maxTargetSec,
+              segmentSourceMin,
+              segmentSourceMax
+            )
+          : null;
+
+      if (sourceTarget !== null) {
+        return this.editedTimeFromSourceTime(segment, sourceTarget);
+      }
+    }
+
+    return this.editedTimeSec;
+  }
+
+  private async renderSeekWithRetry(editedTimeSec: number): Promise<void> {
+    const requestId = ++this.seekRenderRequestId;
+
+    for (let attempt = 0; attempt <= SEEK_RENDER_RETRY_COUNT; attempt += 1) {
+      await this.requestRender(editedTimeSec, true);
+
+      if (requestId !== this.seekRenderRequestId) {
+        return;
+      }
+
+      const outcome = this.lastRenderOutcome;
+      if (
+        outcome &&
+        outcome.isSeek &&
+        outcome.drewFrame &&
+        nearlyEqual(outcome.editedTimeSec, editedTimeSec)
+      ) {
+        return;
+      }
+
+      if (attempt >= SEEK_RENDER_RETRY_COUNT) {
+        return;
+      }
+
+      await new Promise<void>((resolve) => {
+        window.setTimeout(resolve, SEEK_RENDER_RETRY_DELAY_MS);
+      });
+    }
   }
 
   private updateCanvasResolution(
@@ -874,19 +1134,35 @@ export class TimelinePreviewEngine {
       return;
     }
 
-    if (!state.decoder) {
-      this.resetDecoderForSourceTime(state, sourceTimeSec);
-    }
-
+    const hasBufferedFrames = state.frameQueue.length > 0;
     const queueFirstTime = state.frameQueue[0]?.timestampSec ?? Number.POSITIVE_INFINITY;
+    const queueLastTime =
+      state.frameQueue[state.frameQueue.length - 1]?.timestampSec ?? Number.NEGATIVE_INFINITY;
     const movedBackward = sourceTimeSec + PREVIEW_EPSILON < state.lastTargetSourceSec;
     const movedBackwardBy = state.lastTargetSourceSec - sourceTimeSec;
 
-    const seekedBeforeBufferedRange = sourceTimeSec + PREVIEW_EPSILON < queueFirstTime;
-    if (seekedBeforeBufferedRange) {
-      this.resetDecoderForSourceTime(state, sourceTimeSec);
-    } else if (!isSeek && movedBackwardBy > SEEK_BACKWARD_RESET_THRESHOLD_SEC && movedBackward) {
-      this.resetDecoderForSourceTime(state, sourceTimeSec);
+    if (isSeek) {
+      const seekedOutsideBufferedRange =
+        hasBufferedFrames &&
+        (sourceTimeSec + PREVIEW_EPSILON < queueFirstTime ||
+          sourceTimeSec - PREVIEW_EPSILON > queueLastTime);
+      const movedBackwardFarWithoutBufferedCoverage =
+        !hasBufferedFrames && movedBackwardBy > SEEK_BACKWARD_RESET_THRESHOLD_SEC && movedBackward;
+      if (!state.decoder || seekedOutsideBufferedRange || movedBackwardFarWithoutBufferedCoverage) {
+        this.resetDecoderForSourceTime(state, sourceTimeSec);
+      }
+    } else {
+      if (!state.decoder) {
+        this.resetDecoderForSourceTime(state, sourceTimeSec);
+      }
+
+      const seekedBeforeBufferedRange =
+        hasBufferedFrames && sourceTimeSec + PREVIEW_EPSILON < queueFirstTime;
+      if (seekedBeforeBufferedRange) {
+        this.resetDecoderForSourceTime(state, sourceTimeSec);
+      } else if (movedBackwardBy > SEEK_BACKWARD_RESET_THRESHOLD_SEC && movedBackward) {
+        this.resetDecoderForSourceTime(state, sourceTimeSec);
+      }
     }
 
     if (!state.decoder) {
@@ -914,6 +1190,9 @@ export class TimelinePreviewEngine {
       fedUntilSec < wantedUntilSec
     ) {
       if (state.decoder.decodeQueueSize >= MAX_IN_FLIGHT_DECODE_CHUNKS) {
+        if (!isSeek) {
+          break;
+        }
         const queueLengthBeforeWait = state.frameQueue.length;
         await this.waitForDecoderOutput(state, queueLengthBeforeWait, waitBudgetMs);
         if (
@@ -941,8 +1220,38 @@ export class TimelinePreviewEngine {
       fedUntilSec = Math.max(fedUntilSec, sample.ctsSec + sample.durationSec);
     }
 
-    if (fedAny && (isSeek || state.frameQueue.length <= queueLengthBeforeDecode)) {
+    if (isSeek && fedAny && state.frameQueue.length <= queueLengthBeforeDecode) {
       await this.waitForDecoderOutput(state, queueLengthBeforeDecode, waitBudgetMs);
+    }
+
+    if (isSeek) {
+      const seekDeadlineMs = performance.now() + waitBudgetMs;
+      while (performance.now() < seekDeadlineMs) {
+        let hasFrameAtOrBeforeTarget = false;
+        for (const queued of state.frameQueue) {
+          if (queued.timestampSec <= sourceTimeSec + PREVIEW_EPSILON) {
+            hasFrameAtOrBeforeTarget = true;
+            break;
+          }
+        }
+        if (hasFrameAtOrBeforeTarget) {
+          break;
+        }
+
+        if (state.decoder.decodeQueueSize <= 0) {
+          break;
+        }
+
+        const queueLengthBeforeWait = state.frameQueue.length;
+        const remainingWaitMs = Math.max(1, seekDeadlineMs - performance.now());
+        await this.waitForDecoderOutput(state, queueLengthBeforeWait, remainingWaitMs);
+        if (
+          state.frameQueue.length <= queueLengthBeforeWait &&
+          state.decoder.decodeQueueSize <= 0
+        ) {
+          break;
+        }
+      }
     }
 
     state.lastTargetSourceSec = sourceTimeSec;
@@ -1000,6 +1309,18 @@ export class TimelinePreviewEngine {
 
     if (targetIndex < 0) {
       if (isSeek) {
+        const firstFrame = state.frameQueue[0];
+        if (!firstFrame) {
+          return false;
+        }
+        // During seeks, wait for a better frame while decode is still in
+        // flight. Fallback to first frame only when decode is drained.
+        if (
+          firstFrame.timestampSec > sourceTimeSec + PREVIEW_EPSILON &&
+          (state.decoder?.decodeQueueSize ?? 0) > 0
+        ) {
+          return false;
+        }
         targetIndex = 0;
       } else {
         // Keep the previously drawn frame until a newer frame arrives.
@@ -1030,7 +1351,7 @@ export class TimelinePreviewEngine {
       this.ctx.drawImage(frame, x, y, drawWidth, drawHeight);
     }
 
-    if (targetIndex > 0) {
+    if (targetIndex > 0 && !isSeek) {
       const staleFrames = state.frameQueue.splice(0, targetIndex);
       for (const stale of staleFrames) {
         stale.frame.close();
@@ -1069,7 +1390,12 @@ export class TimelinePreviewEngine {
       this.pendingRenderRequest = null;
 
       try {
-        await this.renderEditedTime(request.editedTimeSec, request.isSeek);
+        const drewFrame = await this.renderEditedTime(request.editedTimeSec, request.isSeek);
+        this.lastRenderOutcome = {
+          editedTimeSec: request.editedTimeSec,
+          isSeek: request.isSeek,
+          drewFrame
+        };
       } catch (error) {
         const message = error instanceof Error ? error.message : "Preview rendering failed.";
         this.callbacks.onError?.(message);
@@ -1078,26 +1404,28 @@ export class TimelinePreviewEngine {
     this.renderLoopPromise = null;
   }
 
-  private async renderEditedTime(editedTimeSec: number, isSeek: boolean): Promise<void> {
-      const resolved = resolveSegmentAt(this.segments, editedTimeSec);
-      if (!resolved) {
-        this.paintBlackFrame();
-        return;
-      }
+  private async renderEditedTime(editedTimeSec: number, isSeek: boolean): Promise<boolean> {
+    const resolved = resolveSegmentAt(this.segments, editedTimeSec);
+    if (!resolved) {
+      this.paintBlackFrame();
+      return false;
+    }
 
-      const { segment, sourceTimeSec } = resolved;
-      const state = await this.ensureDemuxedClip(segment.clipId);
+    const { segment, sourceTimeSec } = resolved;
+    const state = await this.ensureDemuxedClip(segment.clipId);
 
-      await this.decodeTowardSourceTime(
-        state,
-        clamp(sourceTimeSec, segment.sourceStart, Math.max(segment.sourceStart, segment.sourceEnd - PREVIEW_EPSILON)),
-        isSeek
-      );
+    await this.decodeTowardSourceTime(
+      state,
+      clamp(
+        sourceTimeSec,
+        segment.sourceStart,
+        Math.max(segment.sourceStart, segment.sourceEnd - PREVIEW_EPSILON)
+      ),
+      isSeek
+    );
 
-      const drew = this.drawQueuedFrame(state, segment, sourceTimeSec, isSeek);
-      if (!drew && isSeek) {
-        this.paintBlackFrame();
-      }
+    const drew = this.drawQueuedFrame(state, segment, sourceTimeSec, isSeek);
+    return drew;
   }
 
   private async ensureAudioContext(): Promise<void> {
@@ -1172,6 +1500,7 @@ export class TimelinePreviewEngine {
       return;
     }
 
+    const generation = ++this.audioSyncGeneration;
     this.stopActiveAudioNode();
 
     const resolved = resolveSegmentAt(this.segments, this.editedTimeSec);
@@ -1186,6 +1515,15 @@ export class TimelinePreviewEngine {
     try {
       const clipState = await this.ensureDemuxedClip(segment.clipId);
       const audioBuffer = await this.getAudioBufferForClip(clipState);
+
+      if (
+        generation !== this.audioSyncGeneration ||
+        !this.isPlaying ||
+        !this.audioContext ||
+        !this.audioGainNode
+      ) {
+        return;
+      }
 
       if (!audioBuffer) {
         return;
@@ -1208,10 +1546,15 @@ export class TimelinePreviewEngine {
       sourceNode.connect(this.audioGainNode);
 
       sourceNode.onended = () => {
-        if (this.activeAudioNode === sourceNode) {
+        if (this.activeAudioNode === sourceNode && generation === this.audioSyncGeneration) {
           this.activeAudioNode = null;
         }
       };
+
+      if (generation !== this.audioSyncGeneration || !this.isPlaying) {
+        sourceNode.disconnect();
+        return;
+      }
 
       const startAt = this.audioContext.currentTime + 0.02;
       sourceNode.start(startAt, boundedSourceTime, remainingSourceSec);

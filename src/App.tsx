@@ -180,12 +180,14 @@ const MAX_SEGMENT_SPEED = 1000;
 const MIN_SEGMENT_SPEED_LOG = Math.log10(MIN_SEGMENT_SPEED);
 const MAX_SEGMENT_SPEED_LOG = Math.log10(MAX_SEGMENT_SPEED);
 const TRIM_SNAP_STEP_SEC = 0.001;
+const TIMELINE_SNAP_THRESHOLD_PX = 12;
 const MIN_CROP_SIZE_PX = 2;
 const PAN_SNAP_THRESHOLD_PX = 12;
 const MIN_PIECE_SCALE = 0.001;
 const MAX_PIECE_SCALE = 1000;
 const MIN_PIECE_SCALE_LOG = Math.log10(MIN_PIECE_SCALE);
 const MAX_PIECE_SCALE_LOG = Math.log10(MAX_PIECE_SCALE);
+const PREVIEW_UI_POSITION_STEP_SEC = 1 / 30;
 const DESKTOP_BREAKPOINT_PX = 1200;
 const LAYOUT_STORAGE_KEY = "videoEditor.layout.v1";
 const DEFAULT_DOCK_TAB: DockTab = "timeline";
@@ -570,6 +572,35 @@ function findSegmentIndex(segments: EditedSegment[], timeSec: number): number {
   return segments.length - 1;
 }
 
+function snapTimelineValueToTargets(
+  valueSec: number,
+  targetsSec: number[],
+  railWidthPx: number,
+  timelineDurationSec: number
+): number {
+  if (!Number.isFinite(valueSec) || railWidthPx <= 0 || timelineDurationSec <= 0) {
+    return valueSec;
+  }
+
+  const thresholdSec =
+    (TIMELINE_SNAP_THRESHOLD_PX / Math.max(1, railWidthPx)) * timelineDurationSec;
+
+  let nearest = valueSec;
+  let nearestDistance = Number.POSITIVE_INFINITY;
+  for (const target of targetsSec) {
+    if (!Number.isFinite(target)) {
+      continue;
+    }
+    const distance = Math.abs(valueSec - target);
+    if (distance < nearestDistance) {
+      nearestDistance = distance;
+      nearest = target;
+    }
+  }
+
+  return nearestDistance <= thresholdSec ? nearest : valueSec;
+}
+
 function moveTimelineItem(
   items: TimelineItem[],
   draggedId: string,
@@ -898,13 +929,17 @@ function App() {
   const previewEngineRef = useRef<TimelinePreviewEngine | null>(null);
   const previewSegmentsRef = useRef<EditedSegment[]>([]);
   const clipsRef = useRef<SourceClip[]>([]);
+  const isPlayingRef = useRef(false);
   const togglePlayPauseRef = useRef<() => void>(() => undefined);
+  const stepPreviewFrameRef = useRef<(direction: -1 | 1) => void>(() => undefined);
   const cropDragRef = useRef<CropDragState | null>(null);
   const previewPanDragRef = useRef<PreviewPanDragState | null>(null);
   const pendingCropRectRef = useRef<CropRect | null>(null);
   const cropDragRafRef = useRef<number | null>(null);
   const pendingPreviewPanRef = useRef<{ panX: number; panY: number } | null>(null);
   const previewPanRafRef = useRef<number | null>(null);
+  const pendingFrameStepCountRef = useRef(0);
+  const isApplyingFrameStepRef = useRef(false);
   const splitterDragRef = useRef<SplitterDragState | null>(null);
   const previousWorkspaceSizeRef = useRef<{ width: number; height: number } | null>(null);
   const previousSelectedTimelineItemIdRef = useRef<string | null>(null);
@@ -1492,7 +1527,13 @@ function App() {
 
     const engine = new TimelinePreviewEngine(canvas, {
       onTimeUpdate: (timeSec) => {
-        setPreviewPositionSec((previous) => (nearlyEqual(previous, timeSec) ? previous : timeSec));
+        setPreviewPositionSec((previous) => {
+          const minStep = isPlayingRef.current ? PREVIEW_UI_POSITION_STEP_SEC : 0.000001;
+          if (Math.abs(previous - timeSec) < minStep) {
+            return previous;
+          }
+          return timeSec;
+        });
 
         const currentSegments = previewSegmentsRef.current;
         if (currentSegments.length === 0) {
@@ -1506,6 +1547,7 @@ function App() {
         setCurrentSegmentIndex((previous) => (previous === nextIndex ? previous : nextIndex));
       },
       onPlayStateChange: (playing) => {
+        isPlayingRef.current = playing;
         setIsPlaying(playing);
       },
       onError: (message) => {
@@ -1726,9 +1768,27 @@ function App() {
       const deltaSec =
         ((event.clientX - drag.startClientX) / drag.railWidthPx) * timelineDurationSec;
       if (drag.mode === "start") {
-        applyTrimStart(drag.initialStartSec + deltaSec);
+        const nextRaw = drag.initialStartSec + deltaSec;
+        const nextValue = event.altKey
+          ? nextRaw
+          : snapTimelineValueToTargets(
+              nextRaw,
+              [playheadRawSec],
+              drag.railWidthPx,
+              timelineDurationSec
+            );
+        applyTrimStart(nextValue);
       } else {
-        applyTrimEnd(drag.initialEndSec + deltaSec);
+        const nextRaw = drag.initialEndSec + deltaSec;
+        const nextValue = event.altKey
+          ? nextRaw
+          : snapTimelineValueToTargets(
+              nextRaw,
+              [playheadRawSec],
+              drag.railWidthPx,
+              timelineDurationSec
+            );
+        applyTrimEnd(nextValue);
       }
     };
 
@@ -1754,7 +1814,7 @@ function App() {
       window.removeEventListener("pointerup", stopDragging);
       window.removeEventListener("pointercancel", stopDragging);
     };
-  }, [isDraggingTrimEdge, timelineDurationSec]);
+  }, [isDraggingTrimEdge, playheadRawSec, timelineDurationSec]);
 
   useEffect(() => {
     if (!isDraggingTrimEdge) {
@@ -1770,13 +1830,16 @@ function App() {
 
   useEffect(() => {
     const handleWindowKeyDown = (event: KeyboardEvent): void => {
+      const isArrowLeft = event.key === "ArrowLeft";
+      const isArrowRight = event.key === "ArrowRight";
+      const isFrameStep = isArrowLeft || isArrowRight;
       const isSpace =
         event.code === "Space" || event.key === " " || event.key === "Spacebar";
-      if (!isSpace || event.defaultPrevented || event.repeat) {
+      if ((!isSpace && !isFrameStep) || event.defaultPrevented) {
         return;
       }
 
-      if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) {
+      if (event.altKey || event.ctrlKey || event.metaKey) {
         return;
       }
 
@@ -1789,7 +1852,15 @@ function App() {
       }
 
       event.preventDefault();
-      togglePlayPauseRef.current();
+      if (isSpace) {
+        if (event.repeat || event.shiftKey) {
+          return;
+        }
+        togglePlayPauseRef.current();
+        return;
+      }
+
+      stepPreviewFrameRef.current(isArrowRight ? 1 : -1);
     };
 
     window.addEventListener("keydown", handleWindowKeyDown);
@@ -1816,7 +1887,15 @@ function App() {
       event.preventDefault();
       const ratio = clamp((event.clientX - drag.railLeftPx) / drag.railWidthPx, 0, 1);
       const rawPosition = ratio * timelineDurationSec;
-      seekToTimelinePosition(rawPosition, false);
+      const nextPosition = event.altKey
+        ? rawPosition
+        : snapTimelineValueToTargets(
+            rawPosition,
+            [trimStartSec, trimEndSec],
+            drag.railWidthPx,
+            timelineDurationSec
+          );
+      seekToTimelinePosition(nextPosition, false);
     };
 
     const stopDragging = (event?: PointerEvent): void => {
@@ -2158,17 +2237,18 @@ function App() {
       return;
     }
 
+    if (!autoPlay && isPlayingRef.current) {
+      engine.pause();
+      isPlayingRef.current = false;
+      setIsPlaying(false);
+    }
+
     engine.seek(clamped);
     if (autoPlay) {
       void engine.play().catch(() => {
         setError("Unable to start playback. Interact with the page and try again.");
       });
       return;
-    }
-
-    if (isPlaying) {
-      engine.pause();
-      setIsPlaying(false);
     }
   }
 
@@ -2179,6 +2259,70 @@ function App() {
 
     const boundedRaw = clamp(rawPositionSec, 0, timelineDurationSec);
     seekToPreviewPosition(boundedRaw, autoPlay);
+  }
+
+  function startFrameStepDrain(): void {
+    if (isApplyingFrameStepRef.current) {
+      return;
+    }
+
+    isApplyingFrameStepRef.current = true;
+    void (async () => {
+      try {
+        while (pendingFrameStepCountRef.current !== 0) {
+          const engine = previewEngineRef.current;
+          if (!engine || previewTimelineSegments.length === 0) {
+            pendingFrameStepCountRef.current = 0;
+            break;
+          }
+
+          const nextDirection: -1 | 1 = pendingFrameStepCountRef.current > 0 ? 1 : -1;
+          pendingFrameStepCountRef.current -= nextDirection;
+
+          if (isPlayingRef.current) {
+            engine.pause();
+            isPlayingRef.current = false;
+            setIsPlaying(false);
+          }
+
+          const stepFps = Math.max(1, frameReadoutFps);
+          const upperBound = Math.max(0, previewDurationSec - 0.0001);
+          const maxFrame = Math.max(0, Math.floor(upperBound * stepFps));
+          const currentSec = clamp(engine.getPositionSec(), 0, upperBound);
+          const currentFrame = clamp(Math.floor(currentSec * stepFps), 0, maxFrame);
+          const targetFrame = clamp(currentFrame + nextDirection, 0, maxFrame);
+          if (targetFrame === currentFrame) {
+            continue;
+          }
+
+          const targetSec = clamp(targetFrame / stepFps + 0.25 / stepFps, 0, upperBound);
+          await engine.seekAndRender(targetSec);
+
+          const boundedNext = clamp(engine.getPositionSec(), 0, upperBound);
+          const nextIndex = findSegmentIndex(previewTimelineSegments, boundedNext);
+          if (nextIndex < 0) {
+            continue;
+          }
+
+          setPreviewPositionSec(boundedNext);
+          setCurrentSegmentIndex(nextIndex);
+        }
+      } finally {
+        isApplyingFrameStepRef.current = false;
+        if (pendingFrameStepCountRef.current !== 0) {
+          startFrameStepDrain();
+        }
+      }
+    })();
+  }
+
+  function stepPreviewFrame(direction: -1 | 1): void {
+    if (previewTimelineSegments.length === 0) {
+      return;
+    }
+
+    pendingFrameStepCountRef.current += direction;
+    startFrameStepDrain();
   }
 
   function applyTrimStart(nextValueSec: number): void {
@@ -2233,6 +2377,7 @@ function App() {
   togglePlayPauseRef.current = () => {
     void togglePlayPause();
   };
+  stepPreviewFrameRef.current = stepPreviewFrame;
 
   function splitTimelineAt(rawPositionSec: number): void {
     if (timelineDisplayItems.length === 0 || timelineDurationSec <= 0) {
@@ -2383,7 +2528,15 @@ function App() {
 
     const ratio = clamp((event.clientX - rect.left) / rect.width, 0, 1);
     const rawPosition = ratio * timelineDurationSec;
-    seekToTimelinePosition(rawPosition, false);
+    const nextPosition = event.altKey
+      ? rawPosition
+      : snapTimelineValueToTargets(
+          rawPosition,
+          [trimStartSec, trimEndSec],
+          rect.width,
+          timelineDurationSec
+        );
+    seekToTimelinePosition(nextPosition, false);
   }
 
   function handleTimelineItemDragStart(
