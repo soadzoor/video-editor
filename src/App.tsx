@@ -644,6 +644,24 @@ function isKeyboardEventFromInteractiveElement(target: EventTarget | null): bool
   );
 }
 
+function isFileDragPayload(dataTransfer: DataTransfer | null): boolean {
+  if (!dataTransfer) {
+    return false;
+  }
+
+  if (dataTransfer.files.length > 0) {
+    return true;
+  }
+
+  for (const item of Array.from(dataTransfer.items)) {
+    if (item.kind === "file") {
+      return true;
+    }
+  }
+
+  return Array.from(dataTransfer.types).includes("Files");
+}
+
 function convertClientToWorkspace(
   clientX: number,
   clientY: number,
@@ -940,6 +958,7 @@ function App() {
   const previewPanRafRef = useRef<number | null>(null);
   const pendingFrameStepCountRef = useRef(0);
   const isApplyingFrameStepRef = useRef(false);
+  const fileDragDepthRef = useRef(0);
   const splitterDragRef = useRef<SplitterDragState | null>(null);
   const previousWorkspaceSizeRef = useRef<{ width: number; height: number } | null>(null);
   const previousSelectedTimelineItemIdRef = useRef<string | null>(null);
@@ -2154,23 +2173,54 @@ function App() {
     event.target.value = "";
   }
 
-  async function handleDrop(event: ReactDragEvent<HTMLElement>): Promise<void> {
+  async function handlePageDrop(event: ReactDragEvent<HTMLElement>): Promise<void> {
+    if (!isFileDragPayload(event.dataTransfer)) {
+      return;
+    }
+
     event.preventDefault();
     event.stopPropagation();
+    fileDragDepthRef.current = 0;
     setIsDragging(false);
     await addVideos(event.dataTransfer.files);
   }
 
-  function handleDragOver(event: ReactDragEvent<HTMLElement>): void {
+  function handlePageDragEnter(event: ReactDragEvent<HTMLElement>): void {
+    if (!isFileDragPayload(event.dataTransfer)) {
+      return;
+    }
+
     event.preventDefault();
     event.stopPropagation();
+    fileDragDepthRef.current += 1;
     setIsDragging(true);
   }
 
-  function handleDragLeave(event: ReactDragEvent<HTMLElement>): void {
+  function handlePageDragOver(event: ReactDragEvent<HTMLElement>): void {
+    if (!isFileDragPayload(event.dataTransfer)) {
+      return;
+    }
+
     event.preventDefault();
     event.stopPropagation();
-    setIsDragging(false);
+    event.dataTransfer.dropEffect = "copy";
+
+    if (!isDragging) {
+      setIsDragging(true);
+    }
+  }
+
+  function handlePageDragLeave(event: ReactDragEvent<HTMLElement>): void {
+    if (!isFileDragPayload(event.dataTransfer)) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    fileDragDepthRef.current = Math.max(0, fileDragDepthRef.current - 1);
+    if (fileDragDepthRef.current === 0) {
+      setIsDragging(false);
+    }
   }
 
   function removeClip(id: string): void {
@@ -3200,13 +3250,7 @@ function App() {
         </div>
       </div>
 
-      <div
-        className={`media-dropzone ${isDragging ? "dragging" : ""}`}
-        onDrop={(event) => void handleDrop(event)}
-        onDragOver={handleDragOver}
-        onDragEnter={handleDragOver}
-        onDragLeave={handleDragLeave}
-      >
+      <div className={`media-dropzone ${isDragging ? "dragging" : ""}`}>
         <p className="dropzone-title">Drop videos here</p>
         <p className="dropzone-subtitle">Multiple files are concatenated by timeline order.</p>
       </div>
@@ -4224,7 +4268,13 @@ function App() {
   );
 
   return (
-    <main className="app-shell">
+    <main
+      className="app-shell"
+      onDrop={(event) => void handlePageDrop(event)}
+      onDragEnter={handlePageDragEnter}
+      onDragOver={handlePageDragOver}
+      onDragLeave={handlePageDragLeave}
+    >
       {error && <p className="status error">{error}</p>}
 
       <section className="workspace-panel top-media-panel">
