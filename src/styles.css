@@ -1158,8 +1158,17 @@ input[type="number"]::-webkit-inner-spin-button {
   transform: translateX(-1px);
 }
 
-.timeline-playhead::before {
-  content: "";
+.timeline-playhead-hitbox {
+  position: absolute;
+  top: -10px;
+  bottom: -8px;
+  left: 50%;
+  width: 20px;
+  transform: translateX(-50%);
+  cursor: ew-resize;
+}
+
+.timeline-playhead-handle {
   position: absolute;
   top: -4px;
   left: 50%;
@@ -1169,25 +1178,14 @@ input[type="number"]::-webkit-inner-spin-button {
   border: 2px solid rgba(5, 16, 31, 0.9);
   background: #ffffff;
   transform: translateX(-50%);
-  pointer-events: none;
-}
-
-.timeline-playhead::after {
-  content: "";
-  position: absolute;
-  top: -10px;
-  bottom: -8px;
-  left: 50%;
-  width: 20px;
-  transform: translateX(-50%);
-  pointer-events: none;
+  cursor: ew-resize;
 }
 
 .timeline-playhead.dragging {
   background: var(--accent);
 }
 
-.timeline-playhead.dragging::before {
+.timeline-playhead.dragging .timeline-playhead-handle {
   background: var(--accent);
 }
 

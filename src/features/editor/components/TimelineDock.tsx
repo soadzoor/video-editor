@@ -1,4 +1,9 @@
-import type { DragEvent as ReactDragEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, RefObject } from "react";
+import type {
+  DragEvent as ReactDragEvent,
+  MouseEvent as ReactMouseEvent,
+  PointerEvent as ReactPointerEvent,
+  RefObject
+} from "react";
 import { formatSecondsLabel, formatSpeedLabel } from "../model/formatters";
 import type { SourceClip, TimelineDisplayItem, TimelineTool } from "../model/types";
 
@@ -110,7 +115,10 @@ function TimelineDock({
           style={{ left: `${playheadPercent}%` }}
           onPointerDown={onPlayheadPointerDown}
           title="Drag playhead"
-        />
+        >
+          <span className="timeline-playhead-hitbox" aria-hidden="true" />
+          <span className="timeline-playhead-handle" aria-hidden="true" />
+        </div>
 
         <div
           className={`trim-range-window${isDraggingTrimEdge ? " dragging" : ""}${
