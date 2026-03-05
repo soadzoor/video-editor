@@ -18,6 +18,7 @@ export interface PreviewClip {
 
 export interface PreviewSegment {
   id: string;
+  timelineItemId?: string;
   clipId: string;
   sourceStart: number;
   sourceEnd: number;
@@ -590,6 +591,61 @@ export class TimelinePreviewEngine {
     if (this.isPlaying) {
       await this.syncAudioToCurrentPosition();
     }
+  }
+
+  public updateTimelineItemTransform(
+    timelineItemId: string,
+    nextTransform: { scale?: number; panX?: number; panY?: number }
+  ): void {
+    if (!timelineItemId || this.segments.length === 0) {
+      return;
+    }
+
+    const nextScale =
+      nextTransform.scale === undefined ? undefined : clampPreviewScale(nextTransform.scale);
+    const nextPanX =
+      nextTransform.panX === undefined ? undefined : sanitizePan(nextTransform.panX);
+    const nextPanY =
+      nextTransform.panY === undefined ? undefined : sanitizePan(nextTransform.panY);
+
+    let hasChanged = false;
+    for (const segment of this.segments) {
+      if (segment.timelineItemId !== timelineItemId) {
+        continue;
+      }
+
+      const scale = nextScale === undefined ? segment.scale : nextScale;
+      const panX = nextPanX === undefined ? segment.panX : nextPanX;
+      const panY = nextPanY === undefined ? segment.panY : nextPanY;
+      if (
+        nearlyEqual(scale, segment.scale) &&
+        nearlyEqual(panX, segment.panX) &&
+        nearlyEqual(panY, segment.panY)
+      ) {
+        continue;
+      }
+
+      segment.scale = scale;
+      segment.panX = panX;
+      segment.panY = panY;
+      hasChanged = true;
+    }
+
+    if (!hasChanged) {
+      return;
+    }
+
+    const drewFrame = this.redrawCurrentFrameWithoutDecode();
+    if (drewFrame) {
+      this.lastRenderOutcome = {
+        editedTimeSec: this.editedTimeSec,
+        isSeek: true,
+        drewFrame: true
+      };
+      return;
+    }
+
+    void this.requestRender(this.editedTimeSec, true);
   }
 
   public getPositionSec(): number {
@@ -1328,28 +1384,9 @@ export class TimelinePreviewEngine {
       }
     }
 
-    const frame = state.frameQueue[targetIndex].frame;
-
-    const frameWidth = frame.displayWidth || frame.codedWidth;
-    const frameHeight = frame.displayHeight || frame.codedHeight;
-
-    const canvasWidth = this.canvas.width;
-    const canvasHeight = this.canvas.height;
-
-    this.ctx.fillStyle = "#000";
-    this.ctx.fillRect(0, 0, canvasWidth, canvasHeight);
-
-    if (frameWidth > 0 && frameHeight > 0) {
-      const containScale = Math.min(canvasWidth / frameWidth, canvasHeight / frameHeight);
-      const baseWidth = frameWidth * containScale;
-      const baseHeight = frameHeight * containScale;
-      const transformScale = clampPreviewScale(segment.scale);
-      const drawWidth = baseWidth * transformScale;
-      const drawHeight = baseHeight * transformScale;
-      const x = (canvasWidth - drawWidth) / 2 + sanitizePan(segment.panX);
-      const y = (canvasHeight - drawHeight) / 2 + sanitizePan(segment.panY);
-      this.ctx.drawImage(frame, x, y, drawWidth, drawHeight);
-    }
+    const queuedFrame = state.frameQueue[targetIndex];
+    const frame = queuedFrame.frame;
+    this.drawFrameWithTransform(frame, segment);
 
     if (targetIndex > 0 && !isSeek) {
       const staleFrames = state.frameQueue.splice(0, targetIndex);
@@ -1359,15 +1396,77 @@ export class TimelinePreviewEngine {
     }
 
     if (isSeek) {
-      state.lastDrawnTimestampSec = frame.timestamp / 1_000_000;
+      state.lastDrawnTimestampSec = queuedFrame.timestampSec;
     } else {
       state.lastDrawnTimestampSec = Math.max(
         state.lastDrawnTimestampSec,
-        frame.timestamp / 1_000_000
+        queuedFrame.timestampSec
       );
     }
 
     return true;
+  }
+
+  private drawFrameWithTransform(frame: VideoFrame, segment: PreviewSegment): void {
+    const frameWidth = frame.displayWidth || frame.codedWidth;
+    const frameHeight = frame.displayHeight || frame.codedHeight;
+
+    const canvasWidth = this.canvas.width;
+    const canvasHeight = this.canvas.height;
+
+    this.ctx.fillStyle = "#000";
+    this.ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+
+    if (frameWidth <= 0 || frameHeight <= 0) {
+      return;
+    }
+
+    const containScale = Math.min(canvasWidth / frameWidth, canvasHeight / frameHeight);
+    const baseWidth = frameWidth * containScale;
+    const baseHeight = frameHeight * containScale;
+    const transformScale = clampPreviewScale(segment.scale);
+    const drawWidth = baseWidth * transformScale;
+    const drawHeight = baseHeight * transformScale;
+    const x = (canvasWidth - drawWidth) / 2 + sanitizePan(segment.panX);
+    const y = (canvasHeight - drawHeight) / 2 + sanitizePan(segment.panY);
+    this.ctx.drawImage(frame, x, y, drawWidth, drawHeight);
+  }
+
+  private pickFrameForTransformRedraw(
+    state: ClipRuntime,
+    sourceTimeSec: number
+  ): QueuedFrame | null {
+    if (state.frameQueue.length === 0) {
+      return null;
+    }
+
+    if (Number.isFinite(state.lastDrawnTimestampSec)) {
+      let best: QueuedFrame | null = null;
+      let bestDistance = Number.POSITIVE_INFINITY;
+      for (const queued of state.frameQueue) {
+        const distance = Math.abs(queued.timestampSec - state.lastDrawnTimestampSec);
+        if (distance >= bestDistance) {
+          continue;
+        }
+        best = queued;
+        bestDistance = distance;
+        if (distance <= PREVIEW_EPSILON) {
+          break;
+        }
+      }
+      if (best) {
+        return best;
+      }
+    }
+
+    let atOrBeforeTarget: QueuedFrame | null = null;
+    for (const queued of state.frameQueue) {
+      if (queued.timestampSec > sourceTimeSec + PREVIEW_EPSILON) {
+        break;
+      }
+      atOrBeforeTarget = queued;
+    }
+    return atOrBeforeTarget ?? state.frameQueue[0] ?? null;
   }
 
   private requestRender(editedTimeSec: number, isSeek: boolean): Promise<void> {
@@ -1426,6 +1525,33 @@ export class TimelinePreviewEngine {
 
     const drew = this.drawQueuedFrame(state, segment, sourceTimeSec, isSeek);
     return drew;
+  }
+
+  private redrawCurrentFrameWithoutDecode(): boolean {
+    const resolved = resolveSegmentAt(this.segments, this.editedTimeSec);
+    if (!resolved) {
+      this.paintBlackFrame();
+      return false;
+    }
+
+    const state = this.clips.get(resolved.segment.clipId);
+    if (!state || state.frameQueue.length === 0) {
+      return false;
+    }
+
+    const boundedSourceTime = clamp(
+      resolved.sourceTimeSec,
+      resolved.segment.sourceStart,
+      Math.max(resolved.segment.sourceStart, resolved.segment.sourceEnd - PREVIEW_EPSILON)
+    );
+    const queuedFrame = this.pickFrameForTransformRedraw(state, boundedSourceTime);
+    if (!queuedFrame) {
+      return false;
+    }
+
+    this.drawFrameWithTransform(queuedFrame.frame, resolved.segment);
+    state.lastDrawnTimestampSec = queuedFrame.timestampSec;
+    return true;
   }
 
   private async ensureAudioContext(): Promise<void> {

@@ -666,6 +666,25 @@ body {
   color: var(--text-muted);
 }
 
+.segment-source-hint {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.segment-source-name {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.segment-source-range {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
 .inspector-stack {
   display: grid;
   gap: 10px;
@@ -960,7 +979,12 @@ input[type="number"]::-webkit-inner-spin-button {
 }
 
 .piece-speed-slider {
+  display: block;
   width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  margin: 0;
 }
 
 .piece-speed-scale {
